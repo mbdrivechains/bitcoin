@@ -102,6 +102,14 @@ static constexpr bool DEFAULT_V2_TRANSPORT{true};
 
 typedef int64_t NodeId;
 
+/** Bitcoin mainnet's message start bytes.
+ *
+ * Spelled out rather than read from CChainParams::Main(), which carries our own
+ * magic. Used only by -bitcoinpeer connections, so that this node can fetch the
+ * pre-fork chain straight from Bitcoin's p2p network while serving it onwards
+ * under our own magic. */
+static constexpr MessageStartChars BITCOIN_MAINNET_MAGIC{0xf9, 0xbe, 0xb4, 0xd9};
+
 struct AddedNodeParams {
     std::string m_added_node;
     bool m_use_v2transport;
@@ -1110,6 +1118,8 @@ public:
         std::vector<std::string> m_added_nodes;
         //! Peers to reach over Bitcoin's network magic instead of ours.
         std::vector<std::string> m_bitcoin_peers;
+        //! The magic to speak to them (-bitcoinpeermagic, regtest-only test knob).
+        MessageStartChars m_bitcoin_magic{BITCOIN_MAINNET_MAGIC};
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
@@ -1154,6 +1164,7 @@ public:
                 m_added_node_params.push_back({bitcoin_peer, /*m_use_v2transport=*/false, /*m_bitcoin_magic=*/true});
             }
         }
+        m_bitcoin_magic = connOptions.m_bitcoin_magic;
         m_onion_binds = connOptions.onion_binds;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
@@ -1624,6 +1635,8 @@ private:
 
     // connection string and whether to use v2 p2p
     std::vector<AddedNodeParams> m_added_node_params GUARDED_BY(m_added_nodes_mutex);
+    //! Network magic used for -bitcoinpeer connections.
+    MessageStartChars m_bitcoin_magic{BITCOIN_MAINNET_MAGIC};
 
     mutable Mutex m_added_nodes_mutex;
     std::vector<CNode*> m_nodes GUARDED_BY(m_nodes_mutex);

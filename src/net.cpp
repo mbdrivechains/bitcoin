@@ -53,14 +53,6 @@ TRACEPOINT_SEMAPHORE(net, inbound_connection);
 TRACEPOINT_SEMAPHORE(net, outbound_connection);
 TRACEPOINT_SEMAPHORE(net, outbound_message);
 
-/** Bitcoin mainnet's message start bytes.
- *
- * Spelled out rather than read from CChainParams::Main(), which carries our own
- * magic. Used only by -bitcoinpeer connections, so that this node can fetch the
- * pre-fork chain straight from Bitcoin's p2p network while serving it onwards
- * under our own magic. */
-static constexpr MessageStartChars BITCOIN_MAINNET_MAGIC{0xf9, 0xbe, 0xb4, 0xd9};
-
 /** Maximum number of block-relay-only anchor connections */
 static constexpr size_t MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
 static_assert (MAX_BLOCK_RELAY_ONLY_ANCHORS <= static_cast<size_t>(MAX_BLOCK_RELAY_ONLY_CONNECTIONS), "MAX_BLOCK_RELAY_ONLY_ANCHORS must not exceed MAX_BLOCK_RELAY_ONLY_CONNECTIONS.");
@@ -554,7 +546,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
-                                    .magic = bitcoin_magic ? std::optional{BITCOIN_MAINNET_MAGIC} : std::nullopt,
+                                    .magic = bitcoin_magic ? std::optional{m_bitcoin_magic} : std::nullopt,
                                 });
         pnode->AddRef();
 
