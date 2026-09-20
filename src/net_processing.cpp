@@ -142,7 +142,7 @@ static constexpr size_t BRIDGE_MAX_FOREIGN_HEADERS{60000};
 /** Bridge: file (in the network datadir) holding the last fed "<hash> <height>". */
 static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
 /** Bridge: transactions rejected for a reason that may clear later are held this long and re-offered. */
-static constexpr size_t BRIDGE_HELD_TXS_MAX{2000};
+static constexpr size_t BRIDGE_HELD_TXS_MAX{50000};
 static constexpr auto BRIDGE_HELD_TXS_MAX_AGE{24h};
 static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
 /** Default time during which a peer must stall block download progress before being disconnected.
@@ -2995,8 +2995,16 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
     }
     if (reason == "txn-already-in-mempool" || reason == "txn-already-known") return BridgeTxResult::KNOWN;
     // May clear later: locktime or sequence not yet reached on our chain, ancestors still
-    // unconfirmed here, or mempool limits.
-    if (what == TxValidationResult::TX_PREMATURE_SPEND || reason == "too-long-mempool-chain" || reason == "mempool full" || reason == "mempool min fee not met") {
+    // unconfirmed here, or mempool limits. These are the reasons a node running the cluster
+    // mempool emits for a condition that a later block clears; "too-long-mempool-chain" is
+    // pre-cluster-mempool and is never emitted, so a chain that overflows a cluster used to
+    // fall through to OTHER and be dropped, taking every later Bitcoin transaction that spends
+    // its outputs with it.
+    if (what == TxValidationResult::TX_PREMATURE_SPEND ||
+        reason == "too-large-cluster" ||
+        reason == "TRUC-violation" ||
+        reason == "mempool full" ||
+        reason == "mempool min fee not met") {
         return BridgeTxResult::HELD;
     }
     return BridgeTxResult::OTHER;
@@ -3006,8 +3014,12 @@ void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::micro
 {
     AssertLockHeld(g_msgproc_mutex);
     if (m_bridge_held_txs.size() >= BRIDGE_HELD_TXS_MAX) {
-        m_bridge_held_txids.erase(m_bridge_held_txs.front().first->GetHash());
-        m_bridge_held_txs.pop_front();
+        // Keep what is already queued: parents precede their children, so dropping the front
+        // would orphan the rest of a chain. The newcomer is lost instead, and that is a hole
+        // in the feed, so it is a warning rather than a silent eviction.
+        LogWarning("bridge: holding queue is full (%u); Bitcoin transaction %s is NOT fed\n",
+                   BRIDGE_HELD_TXS_MAX, tx->GetHash().ToString());
+        return;
     }
     m_bridge_held_txs.emplace_back(tx, now);
     m_bridge_held_txids.insert(tx->GetHash());
