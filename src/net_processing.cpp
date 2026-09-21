@@ -142,8 +142,17 @@ static constexpr size_t BRIDGE_MAX_FOREIGN_HEADERS{60000};
 /** Bridge: file (in the network datadir) holding the last fed "<hash> <height>". */
 static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
 /** Bridge: transactions rejected for a reason that may clear later are held this long and re-offered. */
-static constexpr size_t BRIDGE_HELD_TXS_MAX{50000};
-static constexpr auto BRIDGE_HELD_TXS_MAX_AGE{24h};
+/** Bridge: total weight of held transactions kept before new ones are turned away. A Bitcoin
+ * block is 4 MWU, so this is a hundred blocks' worth (~180 MB of memory at the limit). The
+ * deepest backlog seen on betanet was ~207,000 transactions / 127 MWU, so this is roughly 3x
+ * the worst observed case and comparable to a default mempool. */
+static constexpr uint64_t BRIDGE_HELD_TXS_MAX_WEIGHT{100 * 4'000'000};
+/** Bridge: a held transaction is given up on after this long. It exists to bound the file, not
+ * to decide correctness: anything still valid is re-offered until it is accepted or provably
+ * dead, and a chain that deep takes days to unwind at one cluster per block. */
+static constexpr auto BRIDGE_HELD_TXS_MAX_AGE{30 * 24h};
+/** Bridge: file (in the network datadir) holding the queue across a restart. */
+static constexpr const char* BRIDGE_HELD_FILE{"bridgeheld.dat"};
 static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
 /** Default time during which a peer must stall block download progress before being disconnected.
  * the actual timeout is increased temporarily if peers are disconnected for hitting the timeout */
@@ -722,6 +731,11 @@ private:
     void BridgeInitPeer(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     /** Bridge: persist the last fed block. */
     void BridgeSaveAnchor() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    fs::path BridgeHeldPath() const;
+    /** Bridge: write the held queue, so a restart does not silently drop what it is holding. */
+    void BridgeSaveHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: read the held queue back at the first offer after startup. */
+    void BridgeLoadHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: locator from the foreign tip down through the anchor and the fork parent into our chain. */
     CBlockLocator BridgeLocator(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     bool BridgeKnowsBlock(NodeId nodeid, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -909,6 +923,9 @@ private:
     std::set<Txid> m_bridge_held_txids GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     uint256 m_bridge_held_tip GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     std::chrono::microseconds m_bridge_held_retried_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
+    uint64_t m_bridge_held_weight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    bool m_bridge_held_dirty GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    bool m_bridge_held_loaded GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
     NodeId m_bridge_feed_peer GUARDED_BY(cs_main){-1};
     /** Bridge: recently fed block hashes, so a peer that learns of one later does not queue it again. */
@@ -2787,6 +2804,71 @@ void PeerManagerImpl::BridgeSaveAnchor()
     if (!RenameOver(tmp, path)) LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
 }
 
+fs::path PeerManagerImpl::BridgeHeldPath() const
+{
+    return m_chainman.m_options.datadir / BRIDGE_HELD_FILE;
+}
+
+void PeerManagerImpl::BridgeSaveHeld()
+{
+    AssertLockHeld(g_msgproc_mutex);
+    m_bridge_held_dirty = false;
+    const fs::path path{BridgeHeldPath()};
+    if (m_bridge_held_txs.empty()) {
+        fs::remove(path);
+        return;
+    }
+    const fs::path tmp{path + ".tmp"};
+    {
+        AutoFile out{fsbridge::fopen(tmp, "wb")};
+        if (out.IsNull()) {
+            LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
+            return;
+        }
+        try {
+            out << static_cast<uint64_t>(m_bridge_held_txs.size());
+            for (const auto& [tx, since] : m_bridge_held_txs) {
+                out << TX_WITH_WITNESS(*tx) << static_cast<int64_t>(count_microseconds(since));
+            }
+        } catch (const std::exception& e) {
+            LogWarning("bridge: cannot write %s: %s\n", fs::PathToString(tmp), e.what());
+            return;
+        }
+    }
+    if (!RenameOver(tmp, path)) LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+}
+
+void PeerManagerImpl::BridgeLoadHeld()
+{
+    AssertLockHeld(g_msgproc_mutex);
+    m_bridge_held_loaded = true;
+    AutoFile in{fsbridge::fopen(BridgeHeldPath(), "rb")};
+    if (in.IsNull()) return;
+    try {
+        uint64_t count{0};
+        in >> count;
+        for (uint64_t i = 0; i < count; ++i) {
+            CMutableTransaction mtx;
+            int64_t since{0};
+            in >> TX_WITH_WITNESS(mtx) >> since;
+            CTransactionRef tx{MakeTransactionRef(std::move(mtx))};
+            if (m_bridge_held_txids.insert(tx->GetHash()).second) {
+                m_bridge_held_txs.emplace_back(tx, std::chrono::microseconds{since});
+                m_bridge_held_weight += GetTransactionWeight(*tx);
+            }
+        }
+    } catch (const std::exception& e) {
+        // A truncated file costs us the tail of the queue, not correctness: those transactions
+        // are re-offered when their block is re-fed, or stay missing exactly as before.
+        LogWarning("bridge: %s is unreadable past %u transactions: %s\n",
+                   fs::PathToString(BridgeHeldPath()), m_bridge_held_txs.size(), e.what());
+    }
+    if (!m_bridge_held_txs.empty()) {
+        LogInfo("bridge: resuming with %u held Bitcoin transaction(s), %u WU\n",
+                m_bridge_held_txs.size(), m_bridge_held_weight);
+    }
+}
+
 CBlockLocator PeerManagerImpl::BridgeLocator(NodeId nodeid)
 {
     AssertLockHeld(cs_main);
@@ -3013,21 +3095,24 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
 void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now)
 {
     AssertLockHeld(g_msgproc_mutex);
-    if (m_bridge_held_txs.size() >= BRIDGE_HELD_TXS_MAX) {
+    if (m_bridge_held_weight + GetTransactionWeight(*tx) > BRIDGE_HELD_TXS_MAX_WEIGHT) {
         // Keep what is already queued: parents precede their children, so dropping the front
         // would orphan the rest of a chain. The newcomer is lost instead, and that is a hole
         // in the feed, so it is a warning rather than a silent eviction.
-        LogWarning("bridge: holding queue is full (%u); Bitcoin transaction %s is NOT fed\n",
-                   BRIDGE_HELD_TXS_MAX, tx->GetHash().ToString());
+        LogWarning("bridge: holding queue is full (%u transactions, %u WU); Bitcoin transaction %s is NOT fed\n",
+                   m_bridge_held_txs.size(), m_bridge_held_weight, tx->GetHash().ToString());
         return;
     }
     m_bridge_held_txs.emplace_back(tx, now);
     m_bridge_held_txids.insert(tx->GetHash());
+    m_bridge_held_weight += GetTransactionWeight(*tx);
+    m_bridge_held_dirty = true;
 }
 
 void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
 {
     AssertLockHeld(g_msgproc_mutex);
+    if (!m_bridge_held_loaded) BridgeLoadHeld();
     if (m_bridge_held_txs.empty()) return;
     const uint256 tip{WITH_LOCK(cs_main, return m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{})};
     if (tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
@@ -3059,7 +3144,10 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
         }
     }
     m_bridge_held_txs = std::move(held);
+    m_bridge_held_weight = 0;
+    for (const auto& [tx, _since] : m_bridge_held_txs) m_bridge_held_weight += GetTransactionWeight(*tx);
     if (accepted + dropped > 0) {
+        m_bridge_held_dirty = true;
         LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d dropped, %u still held\n", accepted, dropped, m_bridge_held_txs.size());
     }
 }
@@ -3139,6 +3227,7 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
     LOCK(cs_main);
     BridgeMarkProcessed(pfrom.GetId(), hash);
     if (m_bridge_anchor_dirty) BridgeSaveAnchor();
+    if (m_bridge_held_dirty) BridgeSaveHeld();
     return true;
 }
 
