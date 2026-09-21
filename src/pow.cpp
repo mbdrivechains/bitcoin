@@ -16,14 +16,17 @@
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
-    unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
 
-    // ASERT takes over for every block above the anchor
-    if (IsAsertHeight(params, pindexLast->nHeight + 1)) {
+    // ASERT takes over for every block above the anchor. Chains that never retarget keep
+    // not retargeting; the anchor is only meaningful on chains without min-difficulty
+    // blocks (enforced by the chainparams sanity test).
+    if (!params.fPowNoRetargeting && IsAsertHeight(params, pindexLast->nHeight + 1)) {
         const CBlockIndex* pindexAnchor = pindexLast->GetAncestor(params.EcashAsertAnchorHeight);
         assert(pindexAnchor != nullptr);
         return GetNextASERTWorkRequired(pindexLast, pindexAnchor, params);
     }
+
+    unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
 
     // Only change once per difficulty adjustment interval
     if ((pindexLast->nHeight+1) % params.DifficultyAdjustmentInterval() != 0)
@@ -134,11 +137,13 @@ arith_uint256 CalculateASERT(const arith_uint256& refTarget, const int64_t nPowT
     assert(nHalfLife > 0);
     assert(nHeightDiff >= 0);
 
-    // How far the chain has drifted from its schedule, in seconds. Block timestamps are 32-bit,
-    // so in consensus this is far below 2^44; the clamp only keeps the multiply below from
-    // overflowing on inputs outside that domain, and any clamped drift saturates the result anyway.
+    // How far the chain has drifted from its schedule, in seconds. Block timestamps are 32-bit
+    // and heights fit in 31, so in consensus |drift| is far below 2^44; the clamps only keep
+    // the arithmetic total on inputs outside that domain. A clamped drift saturates the
+    // result to the limit or to 1 for any real half-life, so the answer is unchanged.
     static constexpr int64_t max_drift = int64_t{1} << 44;
-    const int64_t drift = std::clamp(nTimeDiff - nPowTargetSpacing * (nHeightDiff + 1), -max_drift, max_drift);
+    const int64_t schedule = nPowTargetSpacing * std::min(nHeightDiff + 1, int64_t{1} << 32);
+    const int64_t drift = std::clamp(nTimeDiff - schedule, -max_drift, max_drift);
 
     // The drift in units of half-lives, 16.16 fixed point.
     const int64_t exponent = (drift * radix) / nHalfLife;
@@ -154,6 +159,12 @@ arith_uint256 CalculateASERT(const arith_uint256& refTarget, const int64_t nPowT
     const uint64_t factor = 65536 + ((195766423245049ULL * frac + 971821376ULL * frac * frac + 5127ULL * frac * frac * frac + (1ULL << 47)) >> 48);
     assert(factor >= 65536 && factor < 131072);
     arith_uint256 nextTarget = refTarget * uint32_t(factor);
+    // The 256-bit multiply drops its carry. It cannot overflow while powLimit < 2^239 (every
+    // network that may set an anchor; see the chainparams sanity test), but keep the function
+    // total: a product that does not round-trip has run past the limit.
+    if (nextTarget / factor != refTarget) {
+        return powLimit;
+    }
 
     // Undo the factor's radix together with the integer shifts. Anything of 256 bits or
     // more is decided here, before the shift count is narrowed for the shift operators.
@@ -171,7 +182,7 @@ arith_uint256 CalculateASERT(const arith_uint256& refTarget, const int64_t nPowT
         // past the limit. Shifts of 256 or more zero the value and are caught the same way.
         const arith_uint256 nextTargetCopy = nextTarget;
         nextTarget <<= static_cast<unsigned int>(shifts);
-        if ((nextTarget >> static_cast<int>(shifts)) != nextTargetCopy) {
+        if ((nextTarget >> static_cast<unsigned int>(shifts)) != nextTargetCopy) {
             return powLimit;
         }
     }
@@ -191,22 +202,18 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
 {
     if (params.fPowAllowMinDifficultyBlocks) return true;
 
-    if (IsAsertHeight(params, height)) {
-        // Under ASERT the target moves every block by 2^((solve_time - spacing) / half_life).
-        // Bound only how much harder one block may get: a factor of 4, i.e. the previous
-        // block's timestamp sitting two half-lives before its own parent's, which no honest
-        // clock produces. Easier is always allowed.
+    if (!params.fPowNoRetargeting && IsAsertHeight(params, height)) {
+        // Under ASERT the target moves every block by 2^((solve_time - spacing) / half_life),
+        // and a valid chain puts no fixed bound on that: the only floor on a timestamp is the
+        // median of the previous 11, which can sit days behind the tip after a slow stretch,
+        // so a single MTP+1 timestamp can make the next block many times harder. Any constant
+        // limit here would reject such a chain during headers sync. Headers sync therefore
+        // relies on what it already has at these heights: real proof of work on every header
+        // (HasValidProofOfWork) and the minimum-chain-work gate. Only the limit is enforced.
         const arith_uint256 pow_limit = UintToArith256(params.powLimit);
         arith_uint256 observed_new_target;
         observed_new_target.SetCompact(new_nbits);
-        if (observed_new_target > pow_limit) return false;
-
-        arith_uint256 smallest_target;
-        smallest_target.SetCompact(old_nbits);
-        smallest_target >>= 2;
-        arith_uint256 minimum_new_target;
-        minimum_new_target.SetCompact(smallest_target.GetCompact());
-        return observed_new_target >= minimum_new_target;
+        return observed_new_target <= pow_limit;
     }
 
     if (height % params.DifficultyAdjustmentInterval() == 0) {

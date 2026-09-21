@@ -60,10 +60,10 @@ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Par
  * old value for blocks at the difficulty adjustment interval, and otherwise
  * requires the values to be the same.
  *
- * At ASERT heights the target moves every block, so the check becomes: the
- * target may not shrink by more than a factor of 4 in one block. Growth is
- * unbounded (a stalled chain is a valid chain) and claims less work, which is
- * not the attack this guard exists for.
+ * At ASERT heights the target moves every block and a valid chain bounds
+ * that move only through median-time-past, so no fixed per-block limit is
+ * sound; the check there only rejects targets above powLimit. Headers sync
+ * at those heights relies on per-header proof of work and minimum chain work.
  *
  * Always returns true on networks where min difficulty blocks are allowed,
  * such as regtest/testnet.

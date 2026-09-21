@@ -304,7 +304,7 @@ BOOST_AUTO_TEST_CASE(asert_chain)
     // Shape: flat while on schedule, harder through the burst, easier through the stall.
     auto target = [&](int height) { arith_uint256 t; t.SetCompact(blocks[height].nBits); return t; };
     BOOST_CHECK(target(ANCHOR + 50) == target(ANCHOR));
-    for (int i = ANCHOR + 52; i <= ANCHOR + 250; ++i) BOOST_CHECK(target(i) < target(i - 1));
+    for (int i = ANCHOR + 52; i <= ANCHOR + 251; ++i) BOOST_CHECK(target(i) < target(i - 1));
     for (int i = ANCHOR + 252; i <= ANCHOR + 350; ++i) BOOST_CHECK(target(i) > target(i - 1));
     // The 6000 s stall is still far from the limit: recovery is exponential in time, not a reset.
     BOOST_CHECK(target(total - 1) < UintToArith256(params.powLimit));
@@ -318,6 +318,56 @@ BOOST_AUTO_TEST_CASE(asert_chain)
     }
 }
 
+BOOST_AUTO_TEST_CASE(asert_mainnet_shape)
+{
+    // The shape mainnet would use: the anchor IS the fork block. Its target comes from the
+    // EcashForkBits reset inside the 2016-block rule, and the first ASERT block measures the
+    // anchor's solve time against the anchor's parent (a pre-fork block).
+    Consensus::Params params = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    constexpr int FORK{2016};
+    params.EcashHeight = FORK;
+    params.EcashForkBits = ASERT_REF_BITS;
+    params.EcashAsertAnchorHeight = FORK;
+    params.EcashAsertHalfLife = ASERT_HALF_LIFE;
+    const int64_t spacing = params.nPowTargetSpacing;
+    constexpr uint32_t PRE_FORK_BITS{0x1703a30c}; // a Bitcoin-mainnet-like target
+
+    std::vector<CBlockIndex> blocks(FORK + 2);
+    for (int h = 0; h < FORK; ++h) {
+        blocks[h].pprev = h ? &blocks[h - 1] : nullptr;
+        blocks[h].nHeight = h;
+        blocks[h].nTime = 1600000000 + spacing * h;
+        blocks[h].nBits = PRE_FORK_BITS;
+        blocks[h].BuildSkip();
+    }
+    // 2015 -> 2016: the boundary retarget is overridden by the fork reset, not by ASERT.
+    CBlockHeader fork_hdr;
+    fork_hdr.nTime = blocks[FORK - 1].nTime + 3 * spacing; // the fork block took 30 minutes
+    BOOST_CHECK(!IsAsertHeight(params, FORK));
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks[FORK - 1], &fork_hdr, params), ASERT_REF_BITS);
+    blocks[FORK].pprev = &blocks[FORK - 1];
+    blocks[FORK].nHeight = FORK;
+    blocks[FORK].nTime = fork_hdr.nTime;
+    blocks[FORK].nBits = ASERT_REF_BITS;
+    blocks[FORK].BuildSkip();
+
+    // 2016 -> 2017: ASERT, anchored on the fork block, clock started at the fork block's parent.
+    CBlockHeader next_hdr;
+    next_hdr.nTime = blocks[FORK].nTime + spacing;
+    BOOST_CHECK(IsAsertHeight(params, FORK + 1));
+    arith_uint256 ref;
+    ref.SetCompact(ASERT_REF_BITS);
+    const arith_uint256 expected = CalculateASERT(ref, spacing, blocks[FORK].nTime - blocks[FORK - 1].nTime, 0, UintToArith256(params.powLimit), ASERT_HALF_LIFE);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks[FORK], &next_hdr, params), expected.GetCompact());
+    // The fork block was 20 minutes late, so the first ASERT target is easier than the anchor's.
+    BOOST_CHECK(expected > ref);
+    BOOST_CHECK(PermittedDifficultyTransition(params, FORK + 1, ASERT_REF_BITS, expected.GetCompact()));
+
+    // A chain that never retargets ignores the anchor entirely.
+    params.fPowNoRetargeting = true;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks[FORK], &next_hdr, params), ASERT_REF_BITS);
+}
+
 BOOST_AUTO_TEST_CASE(asert_permitted_difficulty_transition)
 {
     Consensus::Params params = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
@@ -329,15 +379,26 @@ BOOST_AUTO_TEST_CASE(asert_permitted_difficulty_transition)
     old_target.SetCompact(ASERT_REF_BITS);
     const auto bits = [](const arith_uint256& t) { return t.GetCompact(); };
 
+    // At ASERT heights only the limit is enforced: any harder, any easier, up to powLimit.
     BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, ASERT_REF_BITS));
-    BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target >> 2)));   // 4x harder: allowed
-    BOOST_CHECK(!PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target / 5)));   // 5x harder: not
-    BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target << 10)));  // easier: always
+    BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target >> 2)));
+    BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target >> 40)));
+    BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(old_target << 10)));
     BOOST_CHECK(PermittedDifficultyTransition(params, height, ASERT_REF_BITS, bits(UintToArith256(params.powLimit))));
     BOOST_CHECK(!PermittedDifficultyTransition(params, height, ASERT_REF_BITS, 0x1e00ffff));             // above powLimit
     // Below the anchor the old rule is untouched: off a boundary the bits must not move at all.
     BOOST_CHECK(!PermittedDifficultyTransition(params, 999, ASERT_REF_BITS, bits(old_target >> 2)));
     BOOST_CHECK(PermittedDifficultyTransition(params, 999, ASERT_REF_BITS, ASERT_REF_BITS));
+}
+
+BOOST_AUTO_TEST_CASE(asert_wide_powlimit_is_total)
+{
+    // With a powLimit at 2^255 (regtest's) the 256-bit multiply can drop its carry. The
+    // round-trip check must turn that into the limit, never a tiny target.
+    const arith_uint256 wide_limit = UintToArith256(uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"});
+    const arith_uint256 t = CalculateASERT(wide_limit, 600, 600 * 10 + ASERT_HALF_LIFE, 9, wide_limit, ASERT_HALF_LIFE);
+    BOOST_CHECK(t == wide_limit);
+    BOOST_CHECK(CalculateASERT(wide_limit, 600, 600 * 10, 9, wide_limit, ASERT_HALF_LIFE) == wide_limit);
 }
 
 void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
@@ -359,10 +420,13 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
     BOOST_CHECK(!over);
     BOOST_CHECK(UintToArith256(consensus.powLimit) >= pow_compact);
 
-    // an ASERT anchor needs a parent block and a positive half-life -- see pow.cpp:GetNextASERTWorkRequired()
+    // an ASERT anchor needs a parent block, a positive half-life, no min-difficulty blocks, and a
+    // powLimit below 2^239 so refTarget * factor (< 2^17) fits -- see pow.cpp:CalculateASERT()
     if (consensus.EcashAsertAnchorHeight != 0) {
         BOOST_CHECK(consensus.EcashAsertAnchorHeight >= 1);
         BOOST_CHECK(consensus.EcashAsertHalfLife > 0);
+        BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+        BOOST_CHECK((UintToArith256(consensus.powLimit) >> 239) == 0);
     }
 
     // check max target * 4*nPowTargetTimespan doesn't overflow -- see pow.cpp:CalculateNextWorkRequired()
