@@ -11,10 +11,19 @@
 #include <uint256.h>
 #include <util/check.h>
 
+#include <algorithm>
+
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
+
+    // ASERT takes over for every block above the anchor
+    if (IsAsertHeight(params, pindexLast->nHeight + 1)) {
+        const CBlockIndex* pindexAnchor = pindexLast->GetAncestor(params.EcashAsertAnchorHeight);
+        assert(pindexAnchor != nullptr);
+        return GetNextASERTWorkRequired(pindexLast, pindexAnchor, params);
+    }
 
     // Only change once per difficulty adjustment interval
     if ((pindexLast->nHeight+1) % params.DifficultyAdjustmentInterval() != 0)
@@ -88,11 +97,117 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
     return bnNew.GetCompact();
 }
 
+bool IsAsertHeight(const Consensus::Params& params, int64_t height)
+{
+    return params.EcashAsertAnchorHeight > 0 && height > params.EcashAsertAnchorHeight;
+}
+
+unsigned int GetNextASERTWorkRequired(const CBlockIndex* pindexPrev, const CBlockIndex* pindexAnchorBlock, const Consensus::Params& params)
+{
+    assert(pindexPrev != nullptr);
+    assert(pindexAnchorBlock != nullptr);
+    // The anchor's own solve time counts, so the clock starts at its parent.
+    assert(pindexAnchorBlock->pprev != nullptr);
+    assert(pindexPrev->nHeight >= pindexAnchorBlock->nHeight);
+
+    const arith_uint256 powLimit = UintToArith256(params.powLimit);
+    arith_uint256 refTarget;
+    refTarget.SetCompact(pindexAnchorBlock->nBits);
+
+    const int64_t nTimeDiff = pindexPrev->GetBlockTime() - pindexAnchorBlock->pprev->GetBlockTime();
+    const int64_t nHeightDiff = pindexPrev->nHeight - pindexAnchorBlock->nHeight;
+
+    const arith_uint256 nextTarget = CalculateASERT(refTarget, params.nPowTargetSpacing, nTimeDiff, nHeightDiff, powLimit, params.EcashAsertHalfLife);
+
+    return nextTarget.GetCompact();
+}
+
+// aserti3-2d, as specified and deployed by Bitcoin Cash (Nov 2020). Kept
+// bit-for-bit compatible with that spec so its published test vectors apply.
+arith_uint256 CalculateASERT(const arith_uint256& refTarget, const int64_t nPowTargetSpacing, const int64_t nTimeDiff, const int64_t nHeightDiff, const arith_uint256& powLimit, const int64_t nHalfLife) noexcept
+{
+    // Fixed-point radix for the exponent: 16 fractional bits.
+    static constexpr int64_t rbits = 16;
+    static constexpr int64_t radix = 1 << rbits;
+
+    assert(refTarget > 0 && refTarget <= powLimit);
+    assert(nHalfLife > 0);
+    assert(nHeightDiff >= 0);
+
+    // How far the chain has drifted from its schedule, in seconds. Block timestamps are 32-bit,
+    // so in consensus this is far below 2^44; the clamp only keeps the multiply below from
+    // overflowing on inputs outside that domain, and any clamped drift saturates the result anyway.
+    static constexpr int64_t max_drift = int64_t{1} << 44;
+    const int64_t drift = std::clamp(nTimeDiff - nPowTargetSpacing * (nHeightDiff + 1), -max_drift, max_drift);
+
+    // The drift in units of half-lives, 16.16 fixed point.
+    const int64_t exponent = (drift * radix) / nHalfLife;
+
+    // Split into integer shifts and a fractional part. Arithmetic right shift floors negative values.
+    int64_t shifts = exponent >> rbits;
+    const uint64_t frac = uint64_t(exponent - shifts * radix);
+    assert(frac < uint64_t(radix));
+
+    // 2^(frac/65536) ~ 1 + 0.695502*x + 0.226698*x^2 + 0.077800*x^3, as a 16.16 factor.
+    // The polynomial's coefficients carry 48 fractional bits; max error ~1.3e-4, well under
+    // one compact-encoding step. factor is in [65536, 131072), so it fits the 32-bit multiply.
+    const uint64_t factor = 65536 + ((195766423245049ULL * frac + 971821376ULL * frac * frac + 5127ULL * frac * frac * frac + (1ULL << 47)) >> 48);
+    assert(factor >= 65536 && factor < 131072);
+    arith_uint256 nextTarget = refTarget * uint32_t(factor);
+
+    // Undo the factor's radix together with the integer shifts. Anything of 256 bits or
+    // more is decided here, before the shift count is narrowed for the shift operators.
+    shifts -= rbits;
+    if (shifts >= 256) {
+        return powLimit;
+    }
+    if (shifts <= -256) {
+        return arith_uint256(1);
+    }
+    if (shifts <= 0) {
+        nextTarget >>= static_cast<unsigned int>(-shifts);
+    } else {
+        // A left shift that does not round-trip has overflowed 256 bits: the target has run
+        // past the limit. Shifts of 256 or more zero the value and are caught the same way.
+        const arith_uint256 nextTargetCopy = nextTarget;
+        nextTarget <<= static_cast<unsigned int>(shifts);
+        if ((nextTarget >> static_cast<int>(shifts)) != nextTargetCopy) {
+            return powLimit;
+        }
+    }
+
+    if (nextTarget == 0) {
+        return arith_uint256(1);
+    }
+    if (nextTarget > powLimit) {
+        return powLimit;
+    }
+    return nextTarget;
+}
+
 // Check that on difficulty adjustments, the new difficulty does not increase
 // or decrease beyond the permitted limits.
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits)
 {
     if (params.fPowAllowMinDifficultyBlocks) return true;
+
+    if (IsAsertHeight(params, height)) {
+        // Under ASERT the target moves every block by 2^((solve_time - spacing) / half_life).
+        // Bound only how much harder one block may get: a factor of 4, i.e. the previous
+        // block's timestamp sitting two half-lives before its own parent's, which no honest
+        // clock produces. Easier is always allowed.
+        const arith_uint256 pow_limit = UintToArith256(params.powLimit);
+        arith_uint256 observed_new_target;
+        observed_new_target.SetCompact(new_nbits);
+        if (observed_new_target > pow_limit) return false;
+
+        arith_uint256 smallest_target;
+        smallest_target.SetCompact(old_nbits);
+        smallest_target >>= 2;
+        arith_uint256 minimum_new_target;
+        minimum_new_target.SetCompact(smallest_target.GetCompact());
+        return observed_new_target >= minimum_new_target;
+    }
 
     if (height % params.DifficultyAdjustmentInterval() == 0) {
         int64_t smallest_timespan = params.nPowTargetTimespan/4;
