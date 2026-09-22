@@ -5,13 +5,23 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <chainparamsbase.h>
+#include <common/args.h>
 #include <pow.h>
+#include <test/data/asert_test_vectors.raw.h>
 #include <test/util/random.h>
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 
+#include <util/strencodings.h>
+
 #include <boost/test/unit_test.hpp>
+
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 BOOST_FIXTURE_TEST_SUITE(pow_tests, BasicTestingSetup)
 
@@ -161,45 +171,117 @@ BOOST_AUTO_TEST_CASE(GetBlockProofEquivalentTime_test)
 // ---- ASERT (aserti3-2d) ----------------------------------------------------
 
 static constexpr uint32_t ASERT_REF_BITS{0x19044b7e}; // ECX beta fork bits, difficulty ~1e9
-static constexpr int64_t ASERT_HALF_LIFE{24 * 60 * 60};
+// A deliberately non-default half-life for the synthetic chains below, so they also prove
+// the parameter is honoured rather than a constant being read somewhere. The value mainnet
+// carries is ASERT_SPEC_HALF_LIFE, which the published vectors and ChainParams_MAIN_sanity use.
+static constexpr int64_t ASERT_TEST_HALF_LIFE{24 * 60 * 60};
+static constexpr int64_t ASERT_SPEC_HALF_LIFE{2 * 24 * 60 * 60};
 
-BOOST_AUTO_TEST_CASE(asert_reference_vectors)
+BOOST_AUTO_TEST_CASE(asert_published_vectors)
 {
-    // Expected values come from an independent big-integer implementation of the spec
-    // (Python, exact arithmetic); this pins the C++ fixed-point and 256-bit plumbing.
+    // The aserti3-2d reference vectors, run01..run12, verbatim as published with the
+    // specification (src/test/data/asert_test_vectors.raw). 14,000 rows over the spec's
+    // parameters: half-life two days, spacing 600 s, powLimit compact 0x1d00ffff, anchors
+    // from the pow limit down to 0x01010000, heights across the signed 32- and 64-bit
+    // boundaries, and runs whose solve times are negative throughout.
+    //
+    // This is what makes "bit-for-bit compatible with the spec" a checked claim rather
+    // than an inferred one: the spec's 2^x is a cubic approximation, so an implementation
+    // can be accurate against true 2^x and still disagree with the reference on most
+    // inputs. Only the reference's own outputs settle it.
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
-    const arith_uint256 pow_limit = UintToArith256(consensus.powLimit);
-    arith_uint256 ref;
-    ref.SetCompact(ASERT_REF_BITS);
+    // The vectors are defined against the spec's own pow limit, compact 0x1d00ffff, which is
+    // where the saturating runs are expected to stop. This tree's MAIN powLimit is the wider
+    // 00000000ffff..ff rather than Bitcoin's 00000000ffff0000..00; both encode to 0x1d00ffff,
+    // but the vectors pin the limit they were generated with rather than borrowing ours.
+    arith_uint256 pow_limit;
+    pow_limit.SetCompact(0x1d00ffff);
+    BOOST_REQUIRE(pow_limit <= UintToArith256(consensus.powLimit));
 
-    struct Vector { int64_t time_diff; int64_t height_diff; uint32_t expected_bits; };
-    static const Vector vectors[] = {
-    {0LL, 0LL, 0x1904463b},
-    {60000LL, 99LL, 0x19044b7e},
-    {146400LL, 99LL, 0x190896fc},
-    {-26400LL, 99LL, 0x190225bf},
-    {1209600LL, 2015LL, 0x19044b7e},
-    {20160LL, 2015LL, 0x1714323e},
-    {2592000LL, 10LL, 0x1d00ffff},
-    {-86400LL, 5LL, 0x19021621},
-    {30259200LL, 49999LL, 0x19225bf0},
-    {37801944LL, 63370LL, 0x1900bb39},
-    {29777357LL, 49924LL, 0x1901086b},
-    {7059149LL, 11921LL, 0x19020512},
-    {59733996LL, 99378LL, 0x190a19dc},
-    {29669336LL, 49302LL, 0x1908ab26},
-    {51257440LL, 85737LL, 0x1900f88e},
-    {56315530LL, 93789LL, 0x1905fe14},
-    {110193822LL, 183966LL, 0x1900f688},
-    {64127900LL, 106323LL, 0x193e5e1f},
-    {31008407LL, 52063LL, 0x1900adb8},
-    {86705137LL, 143800LL, 0x1a008176},
-    {78963726LL, 131691LL, 0x1902d77b},
+    const std::string_view data{reinterpret_cast<const char*>(test::data::asert_test_vectors.data()),
+                                test::data::asert_test_vectors.size()};
+
+    auto field_after = [](std::string_view line, std::string_view key) -> std::optional<std::string_view> {
+        const auto pos = line.find(key);
+        if (pos == std::string_view::npos) return std::nullopt;
+        std::string_view rest = line.substr(pos + key.size());
+        while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.remove_prefix(1);
+        while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' || rest.back() == '\r')) rest.remove_suffix(1);
+        return rest;
     };
-    for (const auto& v : vectors) {
-        const arith_uint256 target = CalculateASERT(ref, consensus.nPowTargetSpacing, v.time_diff, v.height_diff, pow_limit, ASERT_HALF_LIFE);
-        BOOST_CHECK_EQUAL(target.GetCompact(), v.expected_bits);
+
+    // run10's heights run past INT64_MAX on purpose, so they are parsed unsigned and only
+    // the height difference — small in every run — is handed to the algorithm.
+    uint64_t anchor_height{0};
+    int64_t anchor_parent_time{0};
+    arith_uint256 anchor_target;
+    bool anchor_ready{false};
+    int runs{0};
+    int rows{0};
+
+    size_t line_start{0};
+    while (line_start < data.size()) {
+        size_t line_end = data.find('\n', line_start);
+        if (line_end == std::string_view::npos) line_end = data.size();
+        std::string_view line = data.substr(line_start, line_end - line_start);
+        line_start = line_end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+        if (line.empty()) continue;
+
+        if (line.starts_with("##")) {
+            if (line.find("description:") != std::string_view::npos) {
+                ++runs;
+                anchor_ready = false;
+            } else if (const auto v = field_after(line, "anchor height:")) {
+                const auto parsed = ToIntegral<uint64_t>(*v);
+                BOOST_REQUIRE(parsed.has_value());
+                anchor_height = *parsed;
+            } else if (const auto v = field_after(line, "anchor parent time:")) {
+                const auto parsed = ToIntegral<int64_t>(*v);
+                BOOST_REQUIRE(parsed.has_value());
+                anchor_parent_time = *parsed;
+            } else if (const auto v = field_after(line, "anchor nBits:")) {
+                BOOST_REQUIRE(v->starts_with("0x"));
+                const auto parsed = ToIntegral<uint32_t>(v->substr(2), 16);
+                BOOST_REQUIRE(parsed.has_value());
+                const uint32_t compact{*parsed};
+                bool negative{true}, overflow{true};
+                anchor_target.SetCompact(compact, &negative, &overflow);
+                BOOST_REQUIRE(!negative && !overflow && anchor_target > 0);
+                anchor_ready = true;
+            }
+            continue;
+        }
+        if (line.starts_with("#")) continue;
+
+        // "iteration height time target"
+        std::vector<std::string> fields;
+        for (size_t i = 0; i < line.size();) {
+            while (i < line.size() && line[i] == ' ') ++i;
+            const size_t word = i;
+            while (i < line.size() && line[i] != ' ') ++i;
+            if (i > word) fields.emplace_back(line.substr(word, i - word));
+        }
+        BOOST_REQUIRE_EQUAL(fields.size(), 4U);
+        BOOST_REQUIRE(anchor_ready);
+
+        const auto height = ToIntegral<uint64_t>(fields[1]);
+        const auto time = ToIntegral<int64_t>(fields[2]);
+        BOOST_REQUIRE(height.has_value() && time.has_value());
+        BOOST_REQUIRE(fields[3].starts_with("0x"));
+        const auto expected_bits = ToIntegral<uint32_t>(std::string_view{fields[3]}.substr(2), 16);
+        BOOST_REQUIRE(expected_bits.has_value());
+
+        const arith_uint256 got = CalculateASERT(anchor_target, consensus.nPowTargetSpacing,
+                                                 *time - anchor_parent_time,
+                                                 static_cast<int64_t>(*height - anchor_height),
+                                                 pow_limit, ASERT_SPEC_HALF_LIFE);
+        BOOST_CHECK_EQUAL(got.GetCompact(), *expected_bits);
+        ++rows;
     }
+
+    BOOST_CHECK_EQUAL(runs, 12);
+    BOOST_CHECK_EQUAL(rows, 14000);
 }
 
 BOOST_AUTO_TEST_CASE(asert_invariants)
@@ -212,28 +294,28 @@ BOOST_AUTO_TEST_CASE(asert_invariants)
 
     // Exactly on schedule: the anchor target comes back untouched, at any height.
     for (int64_t h : {0, 1, 2015, 2016, 100000, 1000000}) {
-        BOOST_CHECK(CalculateASERT(ref, spacing, spacing * (h + 1), h, pow_limit, ASERT_HALF_LIFE) == ref);
+        BOOST_CHECK(CalculateASERT(ref, spacing, spacing * (h + 1), h, pow_limit, ASERT_TEST_HALF_LIFE) == ref);
     }
     // One half-life behind schedule doubles the target; one ahead halves it.
-    BOOST_CHECK(CalculateASERT(ref, spacing, spacing * 100 + ASERT_HALF_LIFE, 99, pow_limit, ASERT_HALF_LIFE) == ref << 1);
-    BOOST_CHECK(CalculateASERT(ref, spacing, spacing * 100 - ASERT_HALF_LIFE, 99, pow_limit, ASERT_HALF_LIFE) == ref >> 1);
+    BOOST_CHECK(CalculateASERT(ref, spacing, spacing * 100 + ASERT_TEST_HALF_LIFE, 99, pow_limit, ASERT_TEST_HALF_LIFE) == ref << 1);
+    BOOST_CHECK(CalculateASERT(ref, spacing, spacing * 100 - ASERT_TEST_HALF_LIFE, 99, pow_limit, ASERT_TEST_HALF_LIFE) == ref >> 1);
     // Monotone in time: a later timestamp never gives a harder target.
-    arith_uint256 prev = CalculateASERT(ref, spacing, -ASERT_HALF_LIFE * 3, 0, pow_limit, ASERT_HALF_LIFE);
-    for (int64_t t = -ASERT_HALF_LIFE * 3; t <= ASERT_HALF_LIFE * 3; t += 977) {
-        const arith_uint256 cur = CalculateASERT(ref, spacing, t, 0, pow_limit, ASERT_HALF_LIFE);
+    arith_uint256 prev = CalculateASERT(ref, spacing, -ASERT_TEST_HALF_LIFE * 3, 0, pow_limit, ASERT_TEST_HALF_LIFE);
+    for (int64_t t = -ASERT_TEST_HALF_LIFE * 3; t <= ASERT_TEST_HALF_LIFE * 3; t += 977) {
+        const arith_uint256 cur = CalculateASERT(ref, spacing, t, 0, pow_limit, ASERT_TEST_HALF_LIFE);
         BOOST_CHECK(cur >= prev);
         prev = cur;
     }
     // Far behind schedule saturates at the limit; far ahead floors at 1. Both paths are
     // exercised: shifts below 256 (overflow caught by the round-trip check) and at or above it.
-    BOOST_CHECK(CalculateASERT(ref, spacing, ASERT_HALF_LIFE * 40, 0, pow_limit, ASERT_HALF_LIFE) == pow_limit);
-    BOOST_CHECK(CalculateASERT(ref, spacing, ASERT_HALF_LIFE * 300, 0, pow_limit, ASERT_HALF_LIFE) == pow_limit);
-    BOOST_CHECK(CalculateASERT(ref, spacing, int64_t{1} << 50, 0, pow_limit, ASERT_HALF_LIFE) == pow_limit);
-    BOOST_CHECK(CalculateASERT(ref, spacing, -ASERT_HALF_LIFE * 200, 0, pow_limit, ASERT_HALF_LIFE) == arith_uint256{1});
-    BOOST_CHECK(CalculateASERT(ref, spacing, -ASERT_HALF_LIFE * 300, 0, pow_limit, ASERT_HALF_LIFE) == arith_uint256{1});
-    BOOST_CHECK(CalculateASERT(ref, spacing, -(int64_t{1} << 50), 0, pow_limit, ASERT_HALF_LIFE) == arith_uint256{1});
+    BOOST_CHECK(CalculateASERT(ref, spacing, ASERT_TEST_HALF_LIFE * 40, 0, pow_limit, ASERT_TEST_HALF_LIFE) == pow_limit);
+    BOOST_CHECK(CalculateASERT(ref, spacing, ASERT_TEST_HALF_LIFE * 300, 0, pow_limit, ASERT_TEST_HALF_LIFE) == pow_limit);
+    BOOST_CHECK(CalculateASERT(ref, spacing, int64_t{1} << 50, 0, pow_limit, ASERT_TEST_HALF_LIFE) == pow_limit);
+    BOOST_CHECK(CalculateASERT(ref, spacing, -ASERT_TEST_HALF_LIFE * 200, 0, pow_limit, ASERT_TEST_HALF_LIFE) == arith_uint256{1});
+    BOOST_CHECK(CalculateASERT(ref, spacing, -ASERT_TEST_HALF_LIFE * 300, 0, pow_limit, ASERT_TEST_HALF_LIFE) == arith_uint256{1});
+    BOOST_CHECK(CalculateASERT(ref, spacing, -(int64_t{1} << 50), 0, pow_limit, ASERT_TEST_HALF_LIFE) == arith_uint256{1});
     // Starting at the limit and falling behind stays at the limit.
-    BOOST_CHECK(CalculateASERT(pow_limit, spacing, spacing * 10 + ASERT_HALF_LIFE, 9, pow_limit, ASERT_HALF_LIFE) == pow_limit);
+    BOOST_CHECK(CalculateASERT(pow_limit, spacing, spacing * 10 + ASERT_TEST_HALF_LIFE, 9, pow_limit, ASERT_TEST_HALF_LIFE) == pow_limit);
 }
 
 BOOST_AUTO_TEST_CASE(asert_chain)
@@ -243,7 +325,7 @@ BOOST_AUTO_TEST_CASE(asert_chain)
     Consensus::Params params = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     constexpr int ANCHOR{100};
     params.EcashAsertAnchorHeight = ANCHOR;
-    params.EcashAsertHalfLife = ASERT_HALF_LIFE;
+    params.EcashAsertHalfLife = ASERT_TEST_HALF_LIFE;
     const int64_t spacing = params.nPowTargetSpacing;
 
     struct Phase { int64_t gap; int count; };
@@ -328,7 +410,7 @@ BOOST_AUTO_TEST_CASE(asert_mainnet_shape)
     params.EcashHeight = FORK;
     params.EcashForkBits = ASERT_REF_BITS;
     params.EcashAsertAnchorHeight = FORK;
-    params.EcashAsertHalfLife = ASERT_HALF_LIFE;
+    params.EcashAsertHalfLife = ASERT_TEST_HALF_LIFE;
     const int64_t spacing = params.nPowTargetSpacing;
     constexpr uint32_t PRE_FORK_BITS{0x1703a30c}; // a Bitcoin-mainnet-like target
 
@@ -357,7 +439,7 @@ BOOST_AUTO_TEST_CASE(asert_mainnet_shape)
     BOOST_CHECK(IsAsertHeight(params, FORK + 1));
     arith_uint256 ref;
     ref.SetCompact(ASERT_REF_BITS);
-    const arith_uint256 expected = CalculateASERT(ref, spacing, blocks[FORK].nTime - blocks[FORK - 1].nTime, 0, UintToArith256(params.powLimit), ASERT_HALF_LIFE);
+    const arith_uint256 expected = CalculateASERT(ref, spacing, blocks[FORK].nTime - blocks[FORK - 1].nTime, 0, UintToArith256(params.powLimit), ASERT_TEST_HALF_LIFE);
     BOOST_CHECK_EQUAL(GetNextWorkRequired(&blocks[FORK], &next_hdr, params), expected.GetCompact());
     // The fork block was 20 minutes late, so the first ASERT target is easier than the anchor's.
     BOOST_CHECK(expected > ref);
@@ -372,7 +454,7 @@ BOOST_AUTO_TEST_CASE(asert_permitted_difficulty_transition)
 {
     Consensus::Params params = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     params.EcashAsertAnchorHeight = 1000;
-    params.EcashAsertHalfLife = ASERT_HALF_LIFE;
+    params.EcashAsertHalfLife = ASERT_TEST_HALF_LIFE;
     const int64_t height = 1001; // first ASERT block, not a 2016 boundary
 
     arith_uint256 old_target;
@@ -396,9 +478,9 @@ BOOST_AUTO_TEST_CASE(asert_wide_powlimit_is_total)
     // With a powLimit at 2^255 (regtest's) the 256-bit multiply can drop its carry. The
     // round-trip check must turn that into the limit, never a tiny target.
     const arith_uint256 wide_limit = UintToArith256(uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"});
-    const arith_uint256 t = CalculateASERT(wide_limit, 600, 600 * 10 + ASERT_HALF_LIFE, 9, wide_limit, ASERT_HALF_LIFE);
+    const arith_uint256 t = CalculateASERT(wide_limit, 600, 600 * 10 + ASERT_TEST_HALF_LIFE, 9, wide_limit, ASERT_TEST_HALF_LIFE);
     BOOST_CHECK(t == wide_limit);
-    BOOST_CHECK(CalculateASERT(wide_limit, 600, 600 * 10, 9, wide_limit, ASERT_HALF_LIFE) == wide_limit);
+    BOOST_CHECK(CalculateASERT(wide_limit, 600, 600 * 10, 9, wide_limit, ASERT_TEST_HALF_LIFE) == wide_limit);
 }
 
 void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
@@ -440,11 +522,39 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::MAIN);
+    // aserti3-2d: the "2d" is the half-life. Changing it forfeits the published vectors
+    // above and BCH's production history as evidence for this configuration.
+    BOOST_CHECK_EQUAL(CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus().EcashAsertHalfLife, ASERT_SPEC_HALF_LIFE);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::REGTEST);
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_ASERT_sanity)
+{
+    // -testasertanchor changes four consensus values at once, and the bounds they have to
+    // respect are checked nowhere else: the regtest built without the flag is a different
+    // chain. In particular, turning retargeting back on makes CalculateNextWorkRequired
+    // reachable, and sanity_check_chainparams is what pins powLimit under both
+    // 2^239 (CalculateASERT) and (2^256-1)/(4*nPowTargetTimespan) (the 2016-block rule).
+    ArgsManager args;
+    SetupChainParamsBaseOptions(args);
+    args.ForceSetArg("-testasertanchor", "200");
+    sanity_check_chainparams(args, ChainType::REGTEST);
+
+    const auto consensus = CreateChainParams(args, ChainType::REGTEST)->GetConsensus();
+    BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight, 200);
+    BOOST_CHECK_EQUAL(consensus.EcashAsertHalfLife, ASERT_SPEC_HALF_LIFE);
+    BOOST_CHECK(!consensus.fPowNoRetargeting);
+    BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+
+    // 0 disables rather than raising, so that -notestasertanchor behaves like a negation.
+    ArgsManager off;
+    SetupChainParamsBaseOptions(off);
+    off.ForceSetArg("-testasertanchor", "0");
+    BOOST_CHECK_EQUAL(CreateChainParams(off, ChainType::REGTEST)->GetConsensus().EcashAsertAnchorHeight, 0);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_sanity)

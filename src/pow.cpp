@@ -210,6 +210,15 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
         // limit here would reject such a chain during headers sync. Headers sync therefore
         // relies on what it already has at these heights: real proof of work on every header
         // (HasValidProofOfWork) and the minimum-chain-work gate. Only the limit is enforced.
+        //
+        // In the other direction — a cheap header chain built by claiming to be far behind
+        // schedule — timestamps are bounded above by real time plus MAX_FUTURE_BLOCK_TIME,
+        // so how far behind schedule a header may claim to be is bounded by elapsed
+        // wall-clock time rather than by anything an attacker picks. Note the limit of that:
+        // the schedule is measured from the anchor's parent, not from pindexPrev, so the
+        // bound is on time since the anchor. Once the anchor is many half-lives in the past,
+        // a fork off it can reach powLimit cheaply, and what carries the weight there is the
+        // minimum-chain-work gate and the proof of work on each header, not this function.
         const arith_uint256 pow_limit = UintToArith256(params.powLimit);
         arith_uint256 observed_new_target;
         observed_new_target.SetCompact(new_nbits);
