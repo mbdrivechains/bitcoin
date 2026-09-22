@@ -157,6 +157,13 @@ public:
         DeploymentOptions dep_opts{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        /**
+         * Debug-only: put this regtest chain under ASERT with the given anchor height.
+         * Non-zero also turns off fPowNoRetargeting and min-difficulty blocks and lowers
+         * powLimit (with a matching genesis), because none of them can coexist with a
+         * per-block difficulty rule. See -testasertanchor.
+         */
+        int asert_anchor_height{0};
     };
 
     struct MainNetOptions {
