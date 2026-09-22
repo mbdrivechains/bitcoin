@@ -752,6 +752,12 @@ private:
     /** Bridge: offer one Bitcoin transaction to the mempool as sendrawtransaction would; `reason` is set unless accepted or known. */
     BridgeTxResult BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
+    /** Bridge: a held transaction spending an output of `txid`, if there is one. */
+    CTransactionRef BridgeHeldChild(const Txid& txid) const
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: offer a held parent together with the held child that pays for it. */
+    bool BridgeOfferPackage(const CTransactionRef& parent, const CTransactionRef& child)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: keep a transaction for BridgeRetryHeldTxs (oldest evicted beyond BRIDGE_HELD_TXS_MAX). */
     void BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     /** Bridge: re-offer held transactions once our tip has moved or enough time has passed. */
@@ -3086,10 +3092,46 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
         reason == "too-large-cluster" ||
         reason == "TRUC-violation" ||
         reason == "mempool full" ||
-        reason == "mempool min fee not met") {
+        reason == "mempool min fee not met" ||
+        reason == "min relay fee not met") {
         return BridgeTxResult::HELD;
     }
     return BridgeTxResult::OTHER;
+}
+
+CTransactionRef PeerManagerImpl::BridgeHeldChild(const Txid& txid) const
+{
+    AssertLockHeld(g_msgproc_mutex);
+    for (const auto& [tx, _since] : m_bridge_held_txs) {
+        for (const CTxIn& in : tx->vin) {
+            if (in.prevout.hash == txid) return tx;
+        }
+    }
+    return nullptr;
+}
+
+bool PeerManagerImpl::BridgeOfferPackage(const CTransactionRef& parent, const CTransactionRef& child)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    LOCK2(cs_main, m_tx_download_mutex);
+    const Package package{parent, child};
+    const PackageMempoolAcceptResult result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package,
+                                                              /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};
+    bool accepted{false};
+    for (const CTransactionRef& tx : package) {
+        const auto it{result.m_tx_results.find(tx->GetWitnessHash())};
+        if (it == result.m_tx_results.end()) continue;
+        if (it->second.m_result_type != MempoolAcceptResult::ResultType::VALID) continue;
+        m_mempool.AddUnbroadcastTx(tx->GetHash());
+        m_txdownloadman.MempoolAcceptedTx(tx);
+        InitiateTxBroadcastToAll(tx->GetHash(), tx->GetWitnessHash());
+        accepted = true;
+    }
+    if (!accepted) {
+        LogDebug(BCLog::MEMPOOL, "bridge: package %s + %s not accepted: %s\n", parent->GetHash().ToString(),
+                 child->GetHash().ToString(), result.m_state.ToString());
+    }
+    return accepted;
 }
 
 void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now)
@@ -3118,7 +3160,8 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     if (tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
     m_bridge_held_tip = tip;
     m_bridge_held_retried_at = now;
-    int accepted{0}, dropped{0};
+    int accepted{0}, dropped{0}, packaged{0};
+    std::set<Txid> packaged_children;
     std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> held;
     for (const auto& [tx, since] : m_bridge_held_txs) {
         std::string reason;
@@ -3128,10 +3171,26 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
             ++accepted;
             break;
         case BridgeTxResult::HELD:
+            // A transaction below the fee floor never gets in on its own: on Bitcoin a child paid
+            // for it, and that child is held behind it here. Offer the two together, exactly as a
+            // peer's 1p1c package would arrive.
+            if (reason == "min relay fee not met" || reason == "mempool min fee not met") {
+                if (const CTransactionRef child{BridgeHeldChild(tx->GetHash())}) {
+                    if (BridgeOfferPackage(tx, child)) {
+                        ++packaged;
+                        packaged_children.insert(child->GetHash());
+                        break;
+                    }
+                }
+            }
             keep = now - since < BRIDGE_HELD_TXS_MAX_AGE;
             if (!keep) ++dropped;
             break;
         case BridgeTxResult::KNOWN:
+            // Already in: either someone else relayed it, or it went in as the child of a package
+            // earlier in this pass.
+            if (packaged_children.erase(tx->GetHash()) > 0) ++packaged; else ++dropped;
+            break;
         case BridgeTxResult::MISSING:
         case BridgeTxResult::OTHER:
             ++dropped;
@@ -3146,9 +3205,10 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     m_bridge_held_txs = std::move(held);
     m_bridge_held_weight = 0;
     for (const auto& [tx, _since] : m_bridge_held_txs) m_bridge_held_weight += GetTransactionWeight(*tx);
-    if (accepted + dropped > 0) {
+    if (accepted + dropped + packaged > 0) {
         m_bridge_held_dirty = true;
-        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d dropped, %u still held\n", accepted, dropped, m_bridge_held_txs.size());
+        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d dropped, %u still held\n",
+                accepted, packaged, dropped, m_bridge_held_txs.size());
     }
 }
 
