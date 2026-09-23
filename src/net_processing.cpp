@@ -142,12 +142,6 @@ static constexpr int BRIDGE_FOREIGN_KEEP_HEIGHTS{2000};
 static constexpr size_t BRIDGE_MAX_FOREIGN_HEADERS{60000};
 /** Bridge: file (in the network datadir) holding the last fed "<hash> <height>". */
 static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
-/** Bridge: transactions rejected for a reason that may clear later are held this long and re-offered. */
-/** Bridge: total weight of held transactions kept before new ones are turned away. A Bitcoin
- * block is 4 MWU, so this is a hundred blocks' worth (~180 MB of memory at the limit). The
- * deepest backlog seen on betanet was ~207,000 transactions / 127 MWU, so this is roughly 3x
- * the worst observed case and comparable to a default mempool. */
-static constexpr uint64_t BRIDGE_HELD_TXS_MAX_WEIGHT{100 * 4'000'000};
 /** Bridge: refused only on fee, which a child paying for the transaction can cure as a package (Core's
  * package-reconsiderable fee failures; the RBF ones are excluded, package RBF being one-parent-one-child). */
 static bool BridgeBelowFloor(const std::string& reason)
@@ -753,7 +747,7 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
     enum class BridgeTxResult { ACCEPTED, KNOWN, MISSING, HELD, OTHER };
     /** Bridge: offer one Bitcoin transaction to the mempool as sendrawtransaction would; `reason` is set unless accepted or known. */
-    BridgeTxResult BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
+    BridgeTxResult BridgeOfferTx(const CTransactionRef& tx, std::string& reason, std::optional<CFeeRate>* feerate = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
     /** Bridge: offer held parents together with the held child that pays for them (sorted, child last).
      * Returns the transactions that are in the mempool afterwards. */
@@ -765,8 +759,10 @@ private:
     /** Bridge: the held parents of `tx` (in input order, each once). */
     std::vector<Txid> BridgeHeldParents(const CTransaction& tx) const
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
-    /** Bridge: keep a transaction for BridgeRetryHeldTxs (oldest evicted beyond BRIDGE_HELD_TXS_MAX). */
-    void BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    /** Bridge: keep a transaction for BridgeRetryHeldTxs. Never refuses: when the queue is full the feed pauses
+     * instead (BridgeRequestBlocks). `feerate` is set when it was refused on fee. */
+    void BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now, int height, std::optional<CFeeRate> feerate)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     /** Bridge: re-offer held transactions once our tip has moved or enough time has passed. */
     void BridgeRetryHeldTxs(std::chrono::microseconds now)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
@@ -931,12 +927,24 @@ private:
     std::pair<uint256, int> m_bridge_anchor GUARDED_BY(cs_main){uint256{}, -1};
     bool m_bridge_anchor_loaded GUARDED_BY(cs_main){false};
     bool m_bridge_anchor_dirty GUARDED_BY(cs_main){false};
-    /** Bridge: transactions rejected for a reason that may clear later, with when they were first offered. */
-    std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> m_bridge_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: a Bitcoin transaction refused for a reason that may clear later. */
+    struct BridgeHeld {
+        CTransactionRef tx;
+        std::chrono::microseconds since; //!< when it was first held
+        int since_height;                //!< our tip when it was first held: its age is counted in our blocks
+        int64_t weight;                  //!< its weight, kept rather than recomputed on every pass
+        std::optional<CFeeRate> feerate; //!< while refused on fee: offered again only once the floor falls to it
+    };
+    /** Bridge: held transactions, in feed order (parents before children). */
+    std::deque<BridgeHeld> m_bridge_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     std::unordered_set<Txid, SaltedTxidHasher> m_bridge_held_txids GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     uint256 m_bridge_held_tip GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     std::chrono::microseconds m_bridge_held_retried_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
     uint64_t m_bridge_held_weight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    /** Bridge: the part of that held from our last BRIDGE_HELD_YOUNG_BLOCKS blocks; the feed pauses at the limit. */
+    uint64_t m_bridge_young_weight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    bool m_bridge_feed_paused GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    bool m_bridge_parked_warned GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_dirty GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_loaded GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Bridge: a fed block left a transaction below the fee floor; retry at once so a child can carry it. */
@@ -2842,8 +2850,8 @@ void PeerManagerImpl::BridgeSaveHeld()
         }
         try {
             out << static_cast<uint64_t>(m_bridge_held_txs.size());
-            for (const auto& [tx, since] : m_bridge_held_txs) {
-                out << TX_WITH_WITNESS(*tx) << static_cast<int64_t>(count_microseconds(since));
+            for (const BridgeHeld& held : m_bridge_held_txs) {
+                out << TX_WITH_WITNESS(*held.tx) << static_cast<int64_t>(count_microseconds(held.since));
             }
         } catch (const std::exception& e) {
             LogWarning("bridge: cannot write %s: %s\n", fs::PathToString(tmp), e.what());
@@ -2857,6 +2865,8 @@ void PeerManagerImpl::BridgeLoadHeld()
 {
     AssertLockHeld(g_msgproc_mutex);
     m_bridge_held_loaded = true;
+    // The file does not record ages in our blocks, so what it holds counts as young again.
+    const int height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
     AutoFile in{fsbridge::fopen(BridgeHeldPath(), "rb")};
     if (in.IsNull()) return;
     try {
@@ -2868,8 +2878,10 @@ void PeerManagerImpl::BridgeLoadHeld()
             in >> TX_WITH_WITNESS(mtx) >> since;
             CTransactionRef tx{MakeTransactionRef(std::move(mtx))};
             if (m_bridge_held_txids.insert(tx->GetHash()).second) {
-                m_bridge_held_txs.emplace_back(tx, std::chrono::microseconds{since});
-                m_bridge_held_weight += GetTransactionWeight(*tx);
+                const int64_t weight{GetTransactionWeight(*tx)};
+                m_bridge_held_txs.push_back(BridgeHeld{tx, std::chrono::microseconds{since}, height, weight, std::nullopt});
+                m_bridge_held_weight += weight;
+                m_bridge_young_weight += weight;
             }
         }
     } catch (const std::exception& e) {
@@ -3033,6 +3045,20 @@ void PeerManagerImpl::BridgeRequestBlocks(CNode& node, Peer& peer, std::chrono::
     }
 
     if (fc.pending.empty()) return;
+    // Back-pressure. Nothing held is ever refused, so this is what bounds the queue: while what we hold from our
+    // recent blocks is at the limit, fetch no more. The blocks wait on the Bitcoin node, not in our memory.
+    if (m_bridge_young_weight >= m_opts.bridge_held_max_weight) {
+        if (!m_bridge_feed_paused) {
+            m_bridge_feed_paused = true;
+            LogInfo("bridge: holding %u WU from our last %d blocks (limit %u); pausing the Bitcoin feed until it drains\n",
+                    m_bridge_young_weight, BRIDGE_HELD_YOUNG_BLOCKS, m_opts.bridge_held_max_weight);
+        }
+        return;
+    }
+    if (m_bridge_feed_paused) {
+        m_bridge_feed_paused = false;
+        LogInfo("bridge: resuming the Bitcoin feed (%u WU held from our last %d blocks)\n", m_bridge_young_weight, BRIDGE_HELD_YOUNG_BLOCKS);
+    }
     // One peer feeds at a time so blocks are fetched and offered strictly oldest-first. Another
     // peer takes the slot when the feeder is gone, has nothing queued, or has not been served
     // within BRIDGE_BLOCK_TIMEOUT.
@@ -3060,7 +3086,7 @@ void PeerManagerImpl::BridgeRequestBlocks(CNode& node, Peer& peer, std::chrono::
     MakeAndPushMessage(node, NetMsgType::GETDATA, std::vector<CInv>{{MSG_BLOCK | MSG_WITNESS_FLAG, hash}});
 }
 
-PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
+PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactionRef& tx, std::string& reason, std::optional<CFeeRate>* feerate)
 {
     AssertLockHeld(g_msgproc_mutex);
     LOCK2(cs_main, m_tx_download_mutex);
@@ -3079,6 +3105,7 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
         break;
     }
     reason = result.m_state.GetRejectReason();
+    if (feerate) *feerate = result.m_effective_feerate; // set for fee refusals only
     LogDebug(BCLog::MEMPOOL, "bridge: Bitcoin tx %s not accepted: %s\n", tx->GetHash().ToString(), result.m_state.ToString());
     const TxValidationResult what{result.m_state.GetResult()};
     if (what == TxValidationResult::TX_MISSING_INPUTS) {
@@ -3172,20 +3199,16 @@ std::set<Txid> PeerManagerImpl::BridgeOfferPackage(const Package& package)
     return in_mempool;
 }
 
-void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now)
+void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now, int height, std::optional<CFeeRate> feerate)
 {
     AssertLockHeld(g_msgproc_mutex);
-    if (m_bridge_held_weight + GetTransactionWeight(*tx) > BRIDGE_HELD_TXS_MAX_WEIGHT) {
-        // Keep what is already queued: parents precede their children, so dropping the front
-        // would orphan the rest of a chain. The newcomer is lost instead, and that is a hole
-        // in the feed, so it is a warning rather than a silent eviction.
-        LogWarning("bridge: holding queue is full (%u transactions, %u WU); Bitcoin transaction %s is NOT fed\n",
-                   m_bridge_held_txs.size(), m_bridge_held_weight, tx->GetHash().ToString());
-        return;
-    }
-    m_bridge_held_txs.emplace_back(tx, now);
+    // Never refused, however full the queue: a transaction turned away here is never fed again, nor is anything
+    // spending it. BridgeRequestBlocks stops fetching instead, until the queue drains.
+    const int64_t weight{GetTransactionWeight(*tx)};
+    m_bridge_held_txs.push_back(BridgeHeld{tx, now, height, weight, feerate});
     m_bridge_held_txids.insert(tx->GetHash());
-    m_bridge_held_weight += GetTransactionWeight(*tx);
+    m_bridge_held_weight += weight;
+    m_bridge_young_weight += weight;
     m_bridge_held_dirty = true;
 }
 
@@ -3194,19 +3217,23 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     AssertLockHeld(g_msgproc_mutex);
     if (!m_bridge_held_loaded) BridgeLoadHeld();
     if (m_bridge_held_txs.empty()) return;
-    const uint256 tip{WITH_LOCK(cs_main, return m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{})};
+    const auto [tip, tip_height]{WITH_LOCK(cs_main, return std::make_pair(m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{},
+                                                                          m_chainman.ActiveChain().Height()))};
     if (!m_bridge_retry_now && tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
     m_bridge_held_tip = tip;
     m_bridge_held_retried_at = now;
     m_bridge_retry_now = false;
     const auto started{SteadyClock::now()};
-    int offered{0}, accepted{0}, packaged{0}, known{0}, dropped{0};
+    // What a fee refusal is measured against: the higher of the relay floor and the mempool's own.
+    const CFeeRate floor{std::max(m_mempool.GetMinFee(), m_mempool.m_opts.min_relay_feerate)};
+    int offered{0}, unasked{0}, accepted{0}, packaged{0}, known{0}, dropped{0};
     // Held transactions this pass found merely below the fee floor, with their place in `held`: a child that
     // pays for them can take them in as a package.
     std::map<Txid, size_t> below_floor;
     std::set<Txid> taken; // parents that went in as part of a package after being kept this pass
-    std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> held;
-    for (const auto& [tx, since] : m_bridge_held_txs) {
+    std::deque<BridgeHeld> held;
+    for (BridgeHeld& entry : m_bridge_held_txs) {
+        const CTransactionRef& tx{entry.tx};
         // Parents precede their children, so every parent's fate this pass is already settled.
         bool waits{false}, carries{true};
         for (const CTxIn& in : tx->vin) {
@@ -3226,10 +3253,12 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                 for (const Txid& p : parents) at.push_back(below_floor.at(p));
                 std::sort(at.begin(), at.end());
                 Package package;
-                int64_t package_weight{0};
-                for (const size_t k : at) package.push_back(held[k].first);
+                int64_t package_weight{entry.weight};
+                for (const size_t k : at) {
+                    package.push_back(held[k].tx);
+                    package_weight += held[k].weight;
+                }
                 package.push_back(tx);
-                for (const CTransactionRef& member : package) package_weight += GetTransactionWeight(*member);
                 // Core refuses a package over MAX_PACKAGE_WEIGHT outright; don't ask every pass.
                 const std::set<Txid> in{package_weight <= int64_t{MAX_PACKAGE_WEIGHT} ? BridgeOfferPackage(package) : std::set<Txid>{}};
                 for (const Txid& p : parents) {
@@ -3244,10 +3273,17 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                     ++packaged;
                 }
             }
+        } else if (entry.feerate && *entry.feerate < floor && !m_mempool.exists(tx->GetHash())) {
+            // Refused on fee last time and its own feerate is still under the floor, so the mempool would refuse it
+            // again (the check looks at nothing else). Keep it without asking; a child can still carry it.
+            keep = true;
+            ++unasked;
+            below_floor.emplace(tx->GetHash(), held.size());
         } else {
             ++offered;
             std::string reason;
-            switch (BridgeOfferTx(tx, reason)) {
+            std::optional<CFeeRate> feerate;
+            switch (BridgeOfferTx(tx, reason, &feerate)) {
             case BridgeTxResult::ACCEPTED:
                 ++accepted;
                 break;
@@ -3255,6 +3291,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                 // Still refused for a reason that clears. However long it has waited, it stays: the block it
                 // came in is never fed again, so dropping it here would lose it and everything spending it.
                 keep = true;
+                entry.feerate = BridgeBelowFloor(reason) ? feerate : std::nullopt;
                 if (BridgeBelowFloor(reason)) below_floor.emplace(tx->GetHash(), held.size());
                 break;
             case BridgeTxResult::KNOWN:
@@ -3267,24 +3304,33 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
             }
         }
         if (keep) {
-            held.emplace_back(tx, since);
+            held.push_back(std::move(entry));
         } else {
             m_bridge_held_txids.erase(tx->GetHash());
         }
     }
     if (!taken.empty()) {
-        std::erase_if(held, [&](const auto& entry) { return taken.contains(entry.first->GetHash()); });
+        std::erase_if(held, [&](const BridgeHeld& entry) { return taken.contains(entry.tx->GetHash()); });
     }
     m_bridge_held_txs = std::move(held);
     m_bridge_held_weight = 0;
+    m_bridge_young_weight = 0;
     std::optional<std::chrono::microseconds> oldest;
-    for (const auto& [tx, since] : m_bridge_held_txs) {
-        m_bridge_held_weight += GetTransactionWeight(*tx);
-        if (!oldest || since < *oldest) oldest = since;
+    for (const BridgeHeld& entry : m_bridge_held_txs) {
+        m_bridge_held_weight += entry.weight;
+        if (entry.since_height > tip_height - BRIDGE_HELD_YOUNG_BLOCKS) m_bridge_young_weight += entry.weight;
+        if (!oldest || entry.since < *oldest) oldest = entry.since;
     }
-    const std::string summary{strprintf("%u still held%s (%d offered, %.1f ms)", m_bridge_held_txs.size(),
+    // Held longer than BRIDGE_HELD_YOUNG_BLOCKS: kept (it may yet clear) but no longer able to pause the feed.
+    const uint64_t parked{m_bridge_held_weight - m_bridge_young_weight};
+    if (parked > m_opts.bridge_held_max_weight && !m_bridge_parked_warned) {
+        LogWarning("bridge: %u WU has been held for over %d blocks without clearing (more than the %u WU limit); it is kept, but check what it is waiting for\n",
+                   parked, BRIDGE_HELD_YOUNG_BLOCKS, m_opts.bridge_held_max_weight);
+    }
+    m_bridge_parked_warned = parked > m_opts.bridge_held_max_weight;
+    const std::string summary{strprintf("%u still held%s (%d offered, %d under the fee floor unasked, %.1f ms)", m_bridge_held_txs.size(),
                                         oldest ? strprintf(", oldest held %dh", std::chrono::duration_cast<std::chrono::hours>(now - *oldest).count()) : "",
-                                        offered, Ticks<std::chrono::microseconds>(SteadyClock::now() - started) / 1000.0)};
+                                        offered, unasked, Ticks<std::chrono::microseconds>(SteadyClock::now() - started) / 1000.0)};
     if (accepted + packaged + known + dropped > 0) {
         m_bridge_held_dirty = true;
         LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d already there, %d dropped, %s\n",
@@ -3335,19 +3381,21 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
     // Offer every transaction to the mempool in block order. Only the oldest pending block is
     // requested, so block order is guaranteed without a response buffer.
     const auto now{GetTime<std::chrono::microseconds>()};
+    const int tip_height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
     int accepted{0}, known{0}, missing{0}, held{0}, other{0};
     std::map<std::string, int> reasons;
     for (size_t i{1}; i < block->vtx.size(); ++i) {
         const CTransactionRef& tx{block->vtx[i]};
         std::string reason;
+        std::optional<CFeeRate> feerate;
         if (BridgeHasHeldParent(*tx)) {
             // Its parent is held, so the mempool would only report missing inputs.
             ++held;
             ++reasons["parent-held"];
-            BridgeHoldTx(tx, now);
+            BridgeHoldTx(tx, now, tip_height, std::nullopt);
             continue;
         }
-        switch (BridgeOfferTx(tx, reason)) {
+        switch (BridgeOfferTx(tx, reason, &feerate)) {
         case BridgeTxResult::ACCEPTED:
             ++accepted;
             break;
@@ -3360,7 +3408,7 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
         case BridgeTxResult::HELD:
             ++held;
             ++reasons[reason];
-            BridgeHoldTx(tx, now);
+            BridgeHoldTx(tx, now, tip_height, BridgeBelowFloor(reason) ? feerate : std::nullopt);
             // A child later in this block, or the next one, may pay for it: don't wait for our tip to move.
             if (BridgeBelowFloor(reason)) m_bridge_retry_now = true;
             break;
