@@ -41,6 +41,7 @@
 #include <policy/feerate.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <policy/packages.h>
+#include <policy/truc_policy.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -147,6 +148,12 @@ static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
  * deepest backlog seen on betanet was ~207,000 transactions / 127 MWU, so this is roughly 3x
  * the worst observed case and comparable to a default mempool. */
 static constexpr uint64_t BRIDGE_HELD_TXS_MAX_WEIGHT{100 * 4'000'000};
+/** Bridge: refused only on fee, which a child paying for the transaction can cure as a package (Core's
+ * package-reconsiderable fee failures; the RBF ones are excluded, package RBF being one-parent-one-child). */
+static bool BridgeBelowFloor(const std::string& reason)
+{
+    return reason == "min relay fee not met" || reason == "mempool min fee not met" || reason == "mempool full";
+}
 /** Bridge: file (in the network datadir) holding the queue across a restart. */
 static constexpr const char* BRIDGE_HELD_FILE{"bridgeheld.dat"};
 static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
@@ -3084,7 +3091,16 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
         }
         return BridgeTxResult::MISSING;
     }
-    if (reason == "txn-already-in-mempool" || reason == "txn-already-known") return BridgeTxResult::KNOWN;
+    // Already here: in our mempool (possibly with another witness), or confirmed.
+    if (reason == "txn-already-in-mempool" || reason == "txn-same-nonwitness-data-in-mempool" ||
+        reason == "txn-already-known") {
+        return BridgeTxResult::KNOWN;
+    }
+    // A version 3 transaction over the TRUC size cap can never be accepted, however long it waits. Its vsize
+    // here ignores the sigop adjustment, which only makes it larger, so nothing that could pass is dropped.
+    if (reason == "TRUC-violation" && tx->version == TRUC_VERSION && GetVirtualTransactionSize(*tx) > TRUC_MAX_VSIZE) {
+        return BridgeTxResult::OTHER;
+    }
     // May clear later: locktime or sequence not yet reached on our chain, ancestors still
     // unconfirmed here, or mempool limits. These are the reasons a node running the cluster
     // mempool emits for a condition that a later block clears; "too-long-mempool-chain" is
@@ -3096,7 +3112,10 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
         reason == "TRUC-violation" ||
         reason == "mempool full" ||
         reason == "mempool min fee not met" ||
-        reason == "min relay fee not met") {
+        reason == "min relay fee not met" ||
+        // Its parent is in our mempool with ephemeral dust this transaction does not spend (a sibling spent it,
+        // or will). Every child must wait for that parent to confirm here; then it is accepted.
+        reason == "missing-ephemeral-spends") {
         return BridgeTxResult::HELD;
     }
     return BridgeTxResult::OTHER;
@@ -3207,9 +3226,12 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                 for (const Txid& p : parents) at.push_back(below_floor.at(p));
                 std::sort(at.begin(), at.end());
                 Package package;
+                int64_t package_weight{0};
                 for (const size_t k : at) package.push_back(held[k].first);
                 package.push_back(tx);
-                const std::set<Txid> in{BridgeOfferPackage(package)};
+                for (const CTransactionRef& member : package) package_weight += GetTransactionWeight(*member);
+                // Core refuses a package over MAX_PACKAGE_WEIGHT outright; don't ask every pass.
+                const std::set<Txid> in{package_weight <= int64_t{MAX_PACKAGE_WEIGHT} ? BridgeOfferPackage(package) : std::set<Txid>{}};
                 for (const Txid& p : parents) {
                     if (!in.contains(p)) continue;
                     taken.insert(p);
@@ -3233,9 +3255,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                 // Still refused for a reason that clears. However long it has waited, it stays: the block it
                 // came in is never fed again, so dropping it here would lose it and everything spending it.
                 keep = true;
-                if (reason == "min relay fee not met" || reason == "mempool min fee not met") {
-                    below_floor.emplace(tx->GetHash(), held.size());
-                }
+                if (BridgeBelowFloor(reason)) below_floor.emplace(tx->GetHash(), held.size());
                 break;
             case BridgeTxResult::KNOWN:
                 ++known;
@@ -3342,7 +3362,7 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
             ++reasons[reason];
             BridgeHoldTx(tx, now);
             // A child later in this block, or the next one, may pay for it: don't wait for our tip to move.
-            if (reason == "min relay fee not met" || reason == "mempool min fee not met") m_bridge_retry_now = true;
+            if (BridgeBelowFloor(reason)) m_bridge_retry_now = true;
             break;
         case BridgeTxResult::OTHER:
             ++other;
