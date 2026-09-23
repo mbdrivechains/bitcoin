@@ -748,11 +748,15 @@ private:
     /** Bridge: offer one Bitcoin transaction to the mempool as sendrawtransaction would; `reason` is set unless accepted or known. */
     BridgeTxResult BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
-    /** Bridge: a held transaction spending an output of `txid`, if there is one. */
-    CTransactionRef BridgeHeldChild(const Txid& txid) const
+    /** Bridge: offer held parents together with the held child that pays for them (sorted, child last).
+     * Returns the transactions that are in the mempool afterwards. */
+    std::set<Txid> BridgeOfferPackage(const Package& package)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
-    /** Bridge: offer a held parent together with the held child that pays for it. */
-    bool BridgeOfferPackage(const CTransactionRef& parent, const CTransactionRef& child)
+    /** Bridge: whether any input of `tx` spends a held transaction. */
+    bool BridgeHasHeldParent(const CTransaction& tx) const
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: the held parents of `tx` (in input order, each once). */
+    std::vector<Txid> BridgeHeldParents(const CTransaction& tx) const
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: keep a transaction for BridgeRetryHeldTxs (oldest evicted beyond BRIDGE_HELD_TXS_MAX). */
     void BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
@@ -922,12 +926,14 @@ private:
     bool m_bridge_anchor_dirty GUARDED_BY(cs_main){false};
     /** Bridge: transactions rejected for a reason that may clear later, with when they were first offered. */
     std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> m_bridge_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
-    std::set<Txid> m_bridge_held_txids GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    std::unordered_set<Txid, SaltedTxidHasher> m_bridge_held_txids GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     uint256 m_bridge_held_tip GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     std::chrono::microseconds m_bridge_held_retried_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
     uint64_t m_bridge_held_weight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
     bool m_bridge_held_dirty GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_loaded GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Bridge: a fed block left a transaction below the fee floor; retry at once so a child can carry it. */
+    bool m_bridge_retry_now GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
     NodeId m_bridge_feed_peer GUARDED_BY(cs_main){-1};
     /** Bridge: recently fed block hashes, so a peer that learns of one later does not queue it again. */
@@ -3096,39 +3102,55 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
     return BridgeTxResult::OTHER;
 }
 
-CTransactionRef PeerManagerImpl::BridgeHeldChild(const Txid& txid) const
+bool PeerManagerImpl::BridgeHasHeldParent(const CTransaction& tx) const
 {
     AssertLockHeld(g_msgproc_mutex);
-    for (const auto& [tx, _since] : m_bridge_held_txs) {
-        for (const CTxIn& in : tx->vin) {
-            if (in.prevout.hash == txid) return tx;
-        }
-    }
-    return nullptr;
+    return std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& in) { return m_bridge_held_txids.contains(in.prevout.hash); });
 }
 
-bool PeerManagerImpl::BridgeOfferPackage(const CTransactionRef& parent, const CTransactionRef& child)
+std::vector<Txid> PeerManagerImpl::BridgeHeldParents(const CTransaction& tx) const
+{
+    AssertLockHeld(g_msgproc_mutex);
+    std::vector<Txid> parents;
+    for (const CTxIn& in : tx.vin) {
+        if (m_bridge_held_txids.contains(in.prevout.hash) &&
+            std::find(parents.begin(), parents.end(), in.prevout.hash) == parents.end()) {
+            parents.push_back(in.prevout.hash);
+        }
+    }
+    return parents;
+}
+
+std::set<Txid> PeerManagerImpl::BridgeOfferPackage(const Package& package)
 {
     AssertLockHeld(g_msgproc_mutex);
     LOCK2(cs_main, m_tx_download_mutex);
-    const Package package{parent, child};
     const PackageMempoolAcceptResult result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package,
                                                               /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};
-    bool accepted{false};
+    std::set<Txid> in_mempool;
     for (const CTransactionRef& tx : package) {
         const auto it{result.m_tx_results.find(tx->GetWitnessHash())};
         if (it == result.m_tx_results.end()) continue;
-        if (it->second.m_result_type != MempoolAcceptResult::ResultType::VALID) continue;
-        m_mempool.AddUnbroadcastTx(tx->GetHash());
-        m_txdownloadman.MempoolAcceptedTx(tx);
-        InitiateTxBroadcastToAll(tx->GetHash(), tx->GetWitnessHash());
-        accepted = true;
+        switch (it->second.m_result_type) {
+        case MempoolAcceptResult::ResultType::VALID:
+            m_mempool.AddUnbroadcastTx(tx->GetHash());
+            m_txdownloadman.MempoolAcceptedTx(tx);
+            InitiateTxBroadcastToAll(tx->GetHash(), tx->GetWitnessHash());
+            in_mempool.insert(tx->GetHash());
+            break;
+        case MempoolAcceptResult::ResultType::MEMPOOL_ENTRY:
+        case MempoolAcceptResult::ResultType::DIFFERENT_WITNESS:
+            in_mempool.insert(tx->GetHash());
+            break;
+        case MempoolAcceptResult::ResultType::INVALID:
+            break;
+        }
     }
-    if (!accepted) {
-        LogDebug(BCLog::MEMPOOL, "bridge: package %s + %s not accepted: %s\n", parent->GetHash().ToString(),
-                 child->GetHash().ToString(), result.m_state.ToString());
+    if (!in_mempool.contains(package.back()->GetHash())) {
+        LogDebug(BCLog::MEMPOOL, "bridge: package of %u with child %s not accepted: %s\n", package.size(),
+                 package.back()->GetHash().ToString(), result.m_state.ToString());
     }
-    return accepted;
+    return in_mempool;
 }
 
 void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now)
@@ -3154,64 +3176,101 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     if (!m_bridge_held_loaded) BridgeLoadHeld();
     if (m_bridge_held_txs.empty()) return;
     const uint256 tip{WITH_LOCK(cs_main, return m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{})};
-    if (tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
+    if (!m_bridge_retry_now && tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
     m_bridge_held_tip = tip;
     m_bridge_held_retried_at = now;
-    int accepted{0}, dropped{0}, packaged{0};
-    std::optional<std::chrono::microseconds> oldest;
-    std::set<Txid> packaged_children;
+    m_bridge_retry_now = false;
+    const auto started{SteadyClock::now()};
+    int offered{0}, accepted{0}, packaged{0}, known{0}, dropped{0};
+    // Held transactions this pass found merely below the fee floor, with their place in `held`: a child that
+    // pays for them can take them in as a package.
+    std::map<Txid, size_t> below_floor;
+    std::set<Txid> taken; // parents that went in as part of a package after being kept this pass
     std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> held;
     for (const auto& [tx, since] : m_bridge_held_txs) {
-        std::string reason;
+        // Parents precede their children, so every parent's fate this pass is already settled.
+        bool waits{false}, carries{true};
+        for (const CTxIn& in : tx->vin) {
+            if (!m_bridge_held_txids.contains(in.prevout.hash)) continue;
+            waits = true;
+            if (!below_floor.contains(in.prevout.hash)) carries = false;
+        }
         bool keep{false};
-        switch (BridgeOfferTx(tx, reason)) {
-        case BridgeTxResult::ACCEPTED:
-            ++accepted;
-            break;
-        case BridgeTxResult::HELD:
-            // A transaction below the fee floor never gets in on its own: on Bitcoin a child paid
-            // for it, and that child is held behind it here. Offer the two together, exactly as a
-            // peer's 1p1c package would arrive.
-            if (reason == "min relay fee not met" || reason == "mempool min fee not met") {
-                if (const CTransactionRef child{BridgeHeldChild(tx->GetHash())}) {
-                    if (BridgeOfferPackage(tx, child)) {
-                        ++packaged;
-                        packaged_children.insert(child->GetHash());
-                        break;
-                    }
+        if (waits) {
+            // A parent is still held, so this cannot go in by itself and the mempool need not be asked. It can go
+            // in as the child of a package when every held parent is refused only for being below the fee floor
+            // -- on Bitcoin this child paid for them.
+            keep = true;
+            const std::vector<Txid> parents{carries ? BridgeHeldParents(*tx) : std::vector<Txid>{}};
+            if (carries && parents.size() < MAX_PACKAGE_COUNT) {
+                std::vector<size_t> at;
+                for (const Txid& p : parents) at.push_back(below_floor.at(p));
+                std::sort(at.begin(), at.end());
+                Package package;
+                for (const size_t k : at) package.push_back(held[k].first);
+                package.push_back(tx);
+                const std::set<Txid> in{BridgeOfferPackage(package)};
+                for (const Txid& p : parents) {
+                    if (!in.contains(p)) continue;
+                    taken.insert(p);
+                    below_floor.erase(p);
+                    m_bridge_held_txids.erase(p);
+                    ++packaged;
+                }
+                if (in.contains(tx->GetHash())) {
+                    keep = false;
+                    ++packaged;
                 }
             }
-            // Still refused for a reason that clears. However long it has waited, it stays: the block it
-            // came in is never fed again, so dropping it here would lose it and everything spending it.
-            keep = true;
-            break;
-        case BridgeTxResult::KNOWN:
-            // Already in: either someone else relayed it, or it went in as the child of a package
-            // earlier in this pass.
-            if (packaged_children.erase(tx->GetHash()) > 0) ++packaged; else ++dropped;
-            break;
-        case BridgeTxResult::MISSING:
-        case BridgeTxResult::OTHER:
-            ++dropped;
-            break;
+        } else {
+            ++offered;
+            std::string reason;
+            switch (BridgeOfferTx(tx, reason)) {
+            case BridgeTxResult::ACCEPTED:
+                ++accepted;
+                break;
+            case BridgeTxResult::HELD:
+                // Still refused for a reason that clears. However long it has waited, it stays: the block it
+                // came in is never fed again, so dropping it here would lose it and everything spending it.
+                keep = true;
+                if (reason == "min relay fee not met" || reason == "mempool min fee not met") {
+                    below_floor.emplace(tx->GetHash(), held.size());
+                }
+                break;
+            case BridgeTxResult::KNOWN:
+                ++known;
+                break;
+            case BridgeTxResult::MISSING:
+            case BridgeTxResult::OTHER:
+                ++dropped;
+                break;
+            }
         }
         if (keep) {
             held.emplace_back(tx, since);
-            if (!oldest || since < *oldest) oldest = since;
         } else {
             m_bridge_held_txids.erase(tx->GetHash());
         }
     }
+    if (!taken.empty()) {
+        std::erase_if(held, [&](const auto& entry) { return taken.contains(entry.first->GetHash()); });
+    }
     m_bridge_held_txs = std::move(held);
     m_bridge_held_weight = 0;
-    for (const auto& [tx, _since] : m_bridge_held_txs) m_bridge_held_weight += GetTransactionWeight(*tx);
-    const std::string waited{oldest ? strprintf(", oldest held %dh", std::chrono::duration_cast<std::chrono::hours>(now - *oldest).count()) : ""};
-    if (accepted + dropped + packaged > 0) {
+    std::optional<std::chrono::microseconds> oldest;
+    for (const auto& [tx, since] : m_bridge_held_txs) {
+        m_bridge_held_weight += GetTransactionWeight(*tx);
+        if (!oldest || since < *oldest) oldest = since;
+    }
+    const std::string summary{strprintf("%u still held%s (%d offered, %.1f ms)", m_bridge_held_txs.size(),
+                                        oldest ? strprintf(", oldest held %dh", std::chrono::duration_cast<std::chrono::hours>(now - *oldest).count()) : "",
+                                        offered, Ticks<std::chrono::microseconds>(SteadyClock::now() - started) / 1000.0)};
+    if (accepted + packaged + known + dropped > 0) {
         m_bridge_held_dirty = true;
-        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d dropped, %u still held%s\n",
-                accepted, packaged, dropped, m_bridge_held_txs.size(), waited);
+        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d already there, %d dropped, %s\n",
+                accepted, packaged, known, dropped, summary);
     } else {
-        LogDebug(BCLog::MEMPOOL, "bridge: retry pass: nothing accepted, %u still held%s\n", m_bridge_held_txs.size(), waited);
+        LogDebug(BCLog::MEMPOOL, "bridge: retry pass: nothing accepted, %s\n", summary);
     }
 }
 
@@ -3261,6 +3320,13 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
     for (size_t i{1}; i < block->vtx.size(); ++i) {
         const CTransactionRef& tx{block->vtx[i]};
         std::string reason;
+        if (BridgeHasHeldParent(*tx)) {
+            // Its parent is held, so the mempool would only report missing inputs.
+            ++held;
+            ++reasons["parent-held"];
+            BridgeHoldTx(tx, now);
+            continue;
+        }
         switch (BridgeOfferTx(tx, reason)) {
         case BridgeTxResult::ACCEPTED:
             ++accepted;
@@ -3275,6 +3341,8 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
             ++held;
             ++reasons[reason];
             BridgeHoldTx(tx, now);
+            // A child later in this block, or the next one, may pay for it: don't wait for our tip to move.
+            if (reason == "min relay fee not met" || reason == "mempool min fee not met") m_bridge_retry_now = true;
             break;
         case BridgeTxResult::OTHER:
             ++other;
