@@ -147,10 +147,6 @@ static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
  * deepest backlog seen on betanet was ~207,000 transactions / 127 MWU, so this is roughly 3x
  * the worst observed case and comparable to a default mempool. */
 static constexpr uint64_t BRIDGE_HELD_TXS_MAX_WEIGHT{100 * 4'000'000};
-/** Bridge: a held transaction is given up on after this long. It exists to bound the file, not
- * to decide correctness: anything still valid is re-offered until it is accepted or provably
- * dead, and a chain that deep takes days to unwind at one cluster per block. */
-static constexpr auto BRIDGE_HELD_TXS_MAX_AGE{30 * 24h};
 /** Bridge: file (in the network datadir) holding the queue across a restart. */
 static constexpr const char* BRIDGE_HELD_FILE{"bridgeheld.dat"};
 static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
@@ -2864,8 +2860,9 @@ void PeerManagerImpl::BridgeLoadHeld()
             }
         }
     } catch (const std::exception& e) {
-        // A truncated file costs us the tail of the queue, not correctness: those transactions
-        // are re-offered when their block is re-fed, or stay missing exactly as before.
+        // Only the tail is lost, and it is lost for good: the anchor has passed those blocks, so they are
+        // not fed again (a rewind -- removing bridgefeed.dat -- is the recovery). The file is written to a
+        // temporary and renamed over, so a crash mid-write cannot cause this; only damage to the file can.
         LogWarning("bridge: %s is unreadable past %u transactions: %s\n",
                    fs::PathToString(BridgeHeldPath()), m_bridge_held_txs.size(), e.what());
     }
@@ -3161,6 +3158,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     m_bridge_held_tip = tip;
     m_bridge_held_retried_at = now;
     int accepted{0}, dropped{0}, packaged{0};
+    std::optional<std::chrono::microseconds> oldest;
     std::set<Txid> packaged_children;
     std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> held;
     for (const auto& [tx, since] : m_bridge_held_txs) {
@@ -3183,8 +3181,9 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                     }
                 }
             }
-            keep = now - since < BRIDGE_HELD_TXS_MAX_AGE;
-            if (!keep) ++dropped;
+            // Still refused for a reason that clears. However long it has waited, it stays: the block it
+            // came in is never fed again, so dropping it here would lose it and everything spending it.
+            keep = true;
             break;
         case BridgeTxResult::KNOWN:
             // Already in: either someone else relayed it, or it went in as the child of a package
@@ -3198,6 +3197,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
         }
         if (keep) {
             held.emplace_back(tx, since);
+            if (!oldest || since < *oldest) oldest = since;
         } else {
             m_bridge_held_txids.erase(tx->GetHash());
         }
@@ -3205,10 +3205,13 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     m_bridge_held_txs = std::move(held);
     m_bridge_held_weight = 0;
     for (const auto& [tx, _since] : m_bridge_held_txs) m_bridge_held_weight += GetTransactionWeight(*tx);
+    const std::string waited{oldest ? strprintf(", oldest held %dh", std::chrono::duration_cast<std::chrono::hours>(now - *oldest).count()) : ""};
     if (accepted + dropped + packaged > 0) {
         m_bridge_held_dirty = true;
-        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d dropped, %u still held\n",
-                accepted, packaged, dropped, m_bridge_held_txs.size());
+        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d in packages, %d dropped, %u still held%s\n",
+                accepted, packaged, dropped, m_bridge_held_txs.size(), waited);
+    } else {
+        LogDebug(BCLog::MEMPOOL, "bridge: retry pass: nothing accepted, %u still held%s\n", m_bridge_held_txs.size(), waited);
     }
 }
 
