@@ -112,6 +112,9 @@ public:
                                              CTxMemPool& pool, node::Warnings& warnings, Options opts);
     virtual ~PeerManager() = default;
 
+    /** Bridge: write what the Bitcoin block feed tracks. Called at shutdown, once the message handler has stopped. */
+    virtual void FlushBridge() {}
+
     /**
      * Attempt to manually fetch block from a given peer. We must already have the header.
      *

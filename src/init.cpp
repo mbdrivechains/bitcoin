@@ -320,6 +320,7 @@ void Shutdown(NodeContext& node)
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     if (node.connman) node.connman->Stop();
+    if (node.peerman) node.peerman->FlushBridge();
 
     StopTorControl();
 

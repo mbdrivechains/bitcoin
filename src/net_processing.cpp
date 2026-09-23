@@ -156,7 +156,11 @@ static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
 static constexpr int BRIDGE_CONFIRMED_KEEP_BLOCKS{12};
 /** Bridge: at most this many of our new blocks are read for confirmations in one pass. Past a longer gap the reading
  * restarts at the tip, and what was mined in the gap is offered once more and found already here. */
-static constexpr int BRIDGE_SCAN_MAX_BLOCKS{2000};
+static constexpr int BRIDGE_SCAN_MAX_BLOCKS{144};
+/** Bridge: after startup, how long the catch-up gate waits for a header that reaches the height it last read at. */
+static constexpr auto BRIDGE_CATCHUP_GRACE{2min};
+/** Bridge: how often an entry skipped for its feerate is offered anyway (prioritisetransaction; or it went dead). */
+static constexpr auto BRIDGE_FEE_RECHECK_INTERVAL{1h};
 /** Bridge: bridgeheld.dat, version 2. The magic is larger than any count a version 1 file starts with. */
 static constexpr uint64_t BRIDGE_HELD_MAGIC{0x3244'4c45'4847'4442};
 static constexpr uint32_t BRIDGE_HELD_VERSION{2};
@@ -580,7 +584,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
-    ~PeerManagerImpl() override;
+    void FlushBridge() override;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -745,7 +749,7 @@ private:
     /** Bridge: write the held queue, so a restart does not silently drop what it is holding. */
     bool BridgeSaveHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: write the queue, then the anchor, if either changed and BRIDGE_SAVE_INTERVAL has passed (or `force`). */
-    void BridgeMaybeSave(bool force) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, !cs_main);
+    void BridgeMaybeSave(bool force) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) LOCKS_EXCLUDED(::cs_main);
     /** Bridge: read the held queue back at the first offer after startup. */
     void BridgeLoadHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: locator from the foreign tip down through the anchor and the fork parent into our chain. */
@@ -773,7 +777,7 @@ private:
     /** Bridge: offer held parents together with the held child that pays for them (sorted, child last).
      * Returns the transactions that are in the mempool afterwards. */
     std::set<Txid> BridgeOfferPackage(const Package& package)
-        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
     /** Bridge: whether any input of `tx` spends a held transaction. */
     bool BridgeHasHeldParent(const CTransaction& tx) const
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
@@ -788,9 +792,9 @@ private:
     bool BridgeTracked(const Txid& txid) const EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     BridgeInputs BridgeClassifyInputs(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, cs_main);
     /** Bridge: whether the node is caught up enough to judge Bitcoin transactions at all. */
-    bool BridgeReady(int tip_height) const EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    bool BridgeReady(int tip_height, int best_header_height) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: read our blocks since the last pass; returns the tracked transactions mined in them. */
-    std::unordered_set<Txid, SaltedTxidHasher> BridgeScanMined() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, !cs_main);
+    std::unordered_set<Txid, SaltedTxidHasher> BridgeScanMined() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) LOCKS_EXCLUDED(::cs_main);
     /** Bridge: re-offer held transactions once our tip has moved or enough time has passed. */
     void BridgeRetryHeldTxs(std::chrono::microseconds now)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
@@ -984,6 +988,9 @@ private:
     bool m_bridge_held_dirty GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_loaded GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     SteadyClock::time_point m_bridge_saved_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
+    SteadyClock::time_point m_bridge_loaded_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
+    bool m_bridge_catchup_logged GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    std::chrono::microseconds m_bridge_fee_rechecked_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
     /** Bridge: a fed block left a transaction below the fee floor; retry at once so a child can carry it. */
     bool m_bridge_retry_now GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
@@ -2183,10 +2190,11 @@ std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrm
     return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts);
 }
 
-PeerManagerImpl::~PeerManagerImpl()
+void PeerManagerImpl::FlushBridge()
 {
-    // The last word on what the bridge tracks. The message handler has stopped by now (connman is stopped before
-    // peerman is destroyed), and the chainstate and mempool are still up.
+    // The last word on what the bridge tracks: Shutdown calls this after stopping connman (so the message handler no
+    // longer holds g_msgproc_mutex) and before the mempool and chainstate go.
+    AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
     LOCK(NetEventsInterface::g_msgproc_mutex);
     if (m_bridge_held_loaded) BridgeMaybeSave(/*force=*/true);
 }
@@ -2888,6 +2896,7 @@ bool PeerManagerImpl::BridgeSaveHeld()
     const fs::path path{BridgeHeldPath()};
     if (m_bridge_held_txs.empty() && m_bridge_recent.empty()) {
         fs::remove(path);
+        DirectoryCommit(path.parent_path());
         m_bridge_held_dirty = false;
         return true;
     }
@@ -2919,6 +2928,8 @@ bool PeerManagerImpl::BridgeSaveHeld()
         LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
         return false;
     }
+    // The rename itself on disk before the anchor's: ordering must not rest on the filesystem.
+    DirectoryCommit(path.parent_path());
     m_bridge_held_dirty = false;
     return true;
 }
@@ -2926,6 +2937,7 @@ bool PeerManagerImpl::BridgeSaveHeld()
 void PeerManagerImpl::BridgeMaybeSave(bool force)
 {
     AssertLockHeld(g_msgproc_mutex);
+    AssertLockNotHeld(::cs_main);
     const auto [anchor, anchor_dirty]{WITH_LOCK(cs_main, return std::make_pair(m_bridge_anchor, m_bridge_anchor_dirty))};
     if (!m_bridge_held_dirty && !anchor_dirty) return;
     const auto now{SteadyClock::now()};
@@ -2945,10 +2957,12 @@ void PeerManagerImpl::BridgeLoadHeld()
 {
     AssertLockHeld(g_msgproc_mutex);
     m_bridge_held_loaded = true;
+    m_bridge_loaded_at = SteadyClock::now();
+    m_bridge_fee_rechecked_at = GetTime<std::chrono::microseconds>();
     const int height{WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height())};
     AutoFile in{fsbridge::fopen(BridgeHeldPath(), "rb")};
     if (in.IsNull()) return;
-    const auto add{[&](CTransactionRef tx, int64_t since, int since_height, BridgeState state) {
+    const auto add{[&](CTransactionRef tx, int64_t since, int since_height, BridgeState state) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
         const Txid txid{tx->GetHash()};
         if (m_bridge_held_txids.contains(txid) || m_bridge_fed_txids.contains(txid)) return; // first one wins
         const int64_t weight{GetTransactionWeight(*tx)};
@@ -3153,7 +3167,10 @@ void PeerManagerImpl::BridgeRequestBlocks(CNode& node, Peer& peer, std::chrono::
     if (m_chainman.ActiveChain().Height() < fork_height - 1) return;
     // Not before what we track is loaded, nor while we are catching up (BridgeReady): fed then, a transaction whose
     // parent is in a mempool.dat not yet read, or was mined in a block not yet reconnected, looks like an orphan.
-    if (!m_bridge_held_loaded || !BridgeReady(m_chainman.ActiveChain().Height())) return;
+    if (!m_bridge_held_loaded || !BridgeReady(m_chainman.ActiveChain().Height(),
+                                              m_chainman.m_best_header ? m_chainman.m_best_header->nHeight : -1)) {
+        return;
+    }
     ForeignChain& fc{*Assert(State(node.GetId())->m_foreign)};
 
     // Announcements normally keep us current; poll now and then in case one was missed.
@@ -3260,11 +3277,25 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
         reason == "mempool min fee not met" ||
         reason == "min relay fee not met" ||
         // It conflicts with more of our mempool than a replacement may evict; clears as they are mined or expire.
-        reason == "too many potential replacements" ||
+        reason.starts_with("too many potential replacements") ||
         // Its parent is in our mempool with ephemeral dust this transaction does not spend (a sibling spent it,
         // or will). Every child must wait for that parent to confirm here; then it is accepted.
         reason == "missing-ephemeral-spends") {
         return BridgeTxResult::HELD;
+    }
+    // A replacement refused where no input actually conflicts: all it would replace is a TRUC sibling (its parent's one
+    // unconfirmed child slot is taken). That clears when the parent is mined here. Refused over a real conflict, it
+    // yields to the eCash spend that was here first, as the Python bridge does.
+    if (reason.starts_with("insufficient fee") || reason == "replacement-failed") {
+        LOCK(m_mempool.cs);
+        bool conflicts{false};
+        for (const CTxIn& in : tx->vin) {
+            if (m_mempool.GetConflictTx(in.prevout)) {
+                conflicts = true;
+                break;
+            }
+        }
+        if (!conflicts) return BridgeTxResult::HELD;
     }
     return BridgeTxResult::OTHER;
 }
@@ -3272,7 +3303,10 @@ PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactio
 bool PeerManagerImpl::BridgeHasHeldParent(const CTransaction& tx) const
 {
     AssertLockHeld(g_msgproc_mutex);
-    return std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& in) { return m_bridge_held_txids.contains(in.prevout.hash); });
+    for (const CTxIn& in : tx.vin) {
+        if (m_bridge_held_txids.contains(in.prevout.hash)) return true;
+    }
+    return false;
 }
 
 std::vector<Txid> PeerManagerImpl::BridgeHeldParents(const CTransaction& tx) const
@@ -3362,20 +3396,40 @@ PeerManagerImpl::BridgeInputs PeerManagerImpl::BridgeClassifyInputs(const CTrans
     return waits ? BridgeInputs::WAITS : BridgeInputs::AVAILABLE;
 }
 
-bool PeerManagerImpl::BridgeReady(int tip_height) const
+bool PeerManagerImpl::BridgeReady(int tip_height, int best_header_height)
 {
     AssertLockHeld(g_msgproc_mutex);
     // Not while the node is catching up. mempool.dat is loaded only after the blocks are imported, while networking
     // already runs; and after a crash our chain restarts where it was last flushed -- up to an hour behind -- so what
     // we saw mined may not be mined here again yet. Judging Bitcoin transactions then takes their children for orphans.
-    return m_mempool.GetLoadTried() && !m_chainman.m_blockman.LoadingBlocks() && !m_chainman.IsInitialBlockDownload() &&
-           tip_height >= m_bridge_scanned.second;
+    if (!m_mempool.GetLoadTried() || m_chainman.m_blockman.LoadingBlocks() || m_chainman.IsInitialBlockDownload()) return false;
+    if (tip_height >= m_bridge_scanned.second) {
+        m_bridge_catchup_logged = false;
+        return true;
+    }
+    // Behind the height we last read at. Wait while a known header reaches it (we are re-syncing), and briefly after
+    // startup while headers arrive. Otherwise it is not coming back -- a wiped or reset chain, an invalidated branch,
+    // a reorganisation to fewer blocks -- so read from here rather than stall.
+    if (best_header_height >= m_bridge_scanned.second || SteadyClock::now() - m_bridge_loaded_at < BRIDGE_CATCHUP_GRACE) {
+        if (!m_bridge_catchup_logged) {
+            LogInfo("bridge: waiting for our chain to reach height %d (now %d) before judging Bitcoin transactions\n",
+                    m_bridge_scanned.second, tip_height);
+            m_bridge_catchup_logged = true;
+        }
+        return false;
+    }
+    LogInfo("bridge: our chain is at %d, below the height %d we last read at, and no known header gets back there; reading from here\n",
+            tip_height, m_bridge_scanned.second);
+    m_bridge_scanned = {uint256{}, -1};
+    m_bridge_catchup_logged = false;
+    return true;
 }
 
 std::unordered_set<Txid, SaltedTxidHasher> PeerManagerImpl::BridgeScanMined()
 {
     AssertLockHeld(g_msgproc_mutex);
-    std::vector<const CBlockIndex*> connected;
+    AssertLockNotHeld(::cs_main);
+    std::vector<const CBlockIndex*> connected, disconnected;
     int fork_height{-1}, tip_height{-1};
     {
         LOCK(cs_main);
@@ -3394,11 +3448,36 @@ std::unordered_set<Txid, SaltedTxidHasher> PeerManagerImpl::BridgeScanMined()
         }
         fork_height = fork->nHeight;
         for (const CBlockIndex* index{tip}; index != fork; index = index->pprev) connected.push_back(index);
+        for (const CBlockIndex* index{last}; index != fork; index = index->pprev) disconnected.push_back(index);
     }
-    // Reorganised away: what we saw mined above the fork is not mined any more.
+    // Reorganised away: what we saw mined above the fork is not mined any more. Take it back from those blocks (still on
+    // disk) and track it as fed again, at the front of the queue -- its parents are below the fork or earlier among
+    // these, and anything spending it comes later -- so the pass finds it in the mempool, offers it again, or sees it
+    // mined on the new branch. Untracked, a later mempool loss would take it and everything spending it.
+    std::unordered_set<Txid, SaltedTxidHasher> unmined;
     while (!m_bridge_recent.empty() && m_bridge_recent.back().second > fork_height) {
+        unmined.insert(m_bridge_recent.back().first);
         m_bridge_recent_txids.erase(m_bridge_recent.back().first);
         m_bridge_recent.pop_back();
+    }
+    if (!unmined.empty()) {
+        std::vector<CTransactionRef> back;
+        for (auto it{disconnected.rbegin()}; it != disconnected.rend(); ++it) {
+            CBlock block;
+            if (!m_chainman.m_blockman.ReadBlock(block, **it)) continue;
+            for (const CTransactionRef& tx : block.vtx) {
+                if (unmined.contains(tx->GetHash())) back.push_back(tx);
+            }
+        }
+        const auto now{GetTime<std::chrono::microseconds>()};
+        for (auto it{back.rbegin()}; it != back.rend(); ++it) {
+            const Txid& txid{(*it)->GetHash()};
+            if (m_bridge_held_txids.contains(txid) || m_bridge_fed_txids.contains(txid)) continue;
+            m_bridge_held_txs.push_front(BridgeHeld{*it, now, tip_height, GetTransactionWeight(**it), std::nullopt, BridgeState::FED});
+            m_bridge_fed_txids.insert(txid);
+        }
+        m_bridge_held_dirty = true;
+        LogInfo("bridge: %u fed transaction(s) mined in blocks our chain reorganised away are tracked again\n", back.size());
     }
     std::unordered_set<Txid, SaltedTxidHasher> mined;
     for (auto it{connected.rbegin()}; it != connected.rend(); ++it) {
@@ -3426,10 +3505,11 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
 {
     AssertLockHeld(g_msgproc_mutex);
     if (!m_bridge_held_loaded) BridgeLoadHeld();
-    const auto [tip, tip_height]{WITH_LOCK(cs_main, return std::make_pair(m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{},
-                                                                          m_chainman.ActiveChain().Height()))};
-    if (!BridgeReady(tip_height)) return;
-    if (m_bridge_held_txs.empty()) {
+    const auto [tip, tip_height, best_header_height]{WITH_LOCK(cs_main, return std::make_tuple(
+        m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{}, m_chainman.ActiveChain().Height(),
+        m_chainman.m_best_header ? m_chainman.m_best_header->nHeight : -1))};
+    if (!BridgeReady(tip_height, best_header_height)) return;
+    if (m_bridge_held_txs.empty() && m_bridge_recent.empty()) {
         // Nothing tracked, so nothing to read our blocks for; keep our place so a later pass starts from here.
         m_bridge_scanned = {tip, tip_height};
         return;
@@ -3442,6 +3522,10 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     const std::unordered_set<Txid, SaltedTxidHasher> mined{BridgeScanMined()};
     // What a fee refusal is measured against: the higher of the relay floor and the mempool's own.
     const CFeeRate floor{std::max(m_mempool.GetMinFee(), m_mempool.m_opts.min_relay_feerate)};
+    // Now and then offer what the fee floor skips anyway: prioritisetransaction may have lifted it, or it may have gone
+    // dead (an input spent here) and should leave, taking what waits behind it.
+    const bool recheck_fees{now - m_bridge_fee_rechecked_at >= BRIDGE_FEE_RECHECK_INTERVAL};
+    if (recheck_fees) m_bridge_fee_rechecked_at = now;
     int offered{0}, unasked{0}, accepted{0}, refed{0}, packaged{0}, known{0}, confirmed{0}, dropped{0};
     // Held transactions this pass found merely below the fee floor, with their place in `held`: a child that
     // pays for them can take them in as a package.
@@ -3501,7 +3585,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                         ++packaged;
                     }
                 }
-            } else if (!was_fed && entry.feerate && *entry.feerate < floor && !m_mempool.exists(txid)) {
+            } else if (!was_fed && !recheck_fees && entry.feerate && *entry.feerate < floor && !m_mempool.exists(txid)) {
                 // Refused on fee last time and its own feerate is still under the floor, so the mempool would refuse
                 // it again (the check looks at nothing else). Keep it without asking; a child can still carry it.
                 next = BridgeState::WAITING;
@@ -3524,8 +3608,13 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                     if (BridgeBelowFloor(reason)) below_floor.emplace(txid, held.size());
                     break;
                 case BridgeTxResult::KNOWN:
-                    // Already here: in our mempool (someone else relayed it), so watch it as fed; or mined.
-                    if (m_mempool.exists(txid)) next = BridgeState::FED;
+                    // Already here: in our mempool (someone else relayed it), so watch it as fed; or mined since this
+                    // pass read our blocks, so remember it as mined like the rest.
+                    if (m_mempool.exists(txid)) {
+                        next = BridgeState::FED;
+                    } else if (m_bridge_recent_txids.insert(txid).second) {
+                        m_bridge_recent.emplace_back(txid, tip_height + 1);
+                    }
                     ++known;
                     break;
                 case BridgeTxResult::MISSING:
@@ -3635,7 +3724,11 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
         if (BridgeHasHeldParent(*tx)) {
             // Its parent is held, so the mempool would only report missing inputs -- unless another input is one we
             // don't expect at all, and then it can never go in.
-            const BridgeInputs inputs{WITH_LOCK(cs_main, return BridgeClassifyInputs(*tx))};
+            BridgeInputs inputs;
+            {
+                LOCK(cs_main);
+                inputs = BridgeClassifyInputs(*tx);
+            }
             if (inputs == BridgeInputs::DEAD) {
                 ++missing;
                 continue;
