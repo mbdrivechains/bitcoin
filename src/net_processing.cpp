@@ -160,6 +160,9 @@ static constexpr int BRIDGE_SCAN_MAX_BLOCKS{2000};
 /** Bridge: bridgeheld.dat, version 2. The magic is larger than any count a version 1 file starts with. */
 static constexpr uint64_t BRIDGE_HELD_MAGIC{0x3244'4c45'4847'4442};
 static constexpr uint32_t BRIDGE_HELD_VERSION{2};
+/** Bridge: the queue and the anchor are written at most this often (and at shutdown). A crash re-feeds the Bitcoin
+ * blocks since the last write, which is harmless: nothing tracked is fed twice. */
+static constexpr auto BRIDGE_SAVE_INTERVAL{60s};
 /** Default time during which a peer must stall block download progress before being disconnected.
  * the actual timeout is increased temporarily if peers are disconnected for hitting the timeout */
 static constexpr auto BLOCK_STALLING_TIMEOUT_DEFAULT{2s};
@@ -577,6 +580,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+    ~PeerManagerImpl() override;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -736,10 +740,12 @@ private:
     /** Bridge: create the peer's ForeignChain, seeded with the persisted anchor and its ancestry. */
     void BridgeInitPeer(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     /** Bridge: persist the last fed block. */
-    void BridgeSaveAnchor() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool BridgeWriteAnchor(const std::pair<uint256, int>& anchor) const;
     fs::path BridgeHeldPath() const;
     /** Bridge: write the held queue, so a restart does not silently drop what it is holding. */
-    void BridgeSaveHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    bool BridgeSaveHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: write the queue, then the anchor, if either changed and BRIDGE_SAVE_INTERVAL has passed (or `force`). */
+    void BridgeMaybeSave(bool force) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, !cs_main);
     /** Bridge: read the held queue back at the first offer after startup. */
     void BridgeLoadHeld() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: locator from the foreign tip down through the anchor and the fork parent into our chain. */
@@ -977,6 +983,7 @@ private:
     bool m_bridge_parked_warned GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_dirty GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     bool m_bridge_held_loaded GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    SteadyClock::time_point m_bridge_saved_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
     /** Bridge: a fed block left a transaction below the fee floor; retry at once so a child can carry it. */
     bool m_bridge_retry_now GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
@@ -2176,6 +2183,14 @@ std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrm
     return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts);
 }
 
+PeerManagerImpl::~PeerManagerImpl()
+{
+    // The last word on what the bridge tracks. The message handler has stopped by now (connman is stopped before
+    // peerman is destroyed), and the chainstate and mempool are still up.
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    if (m_bridge_held_loaded) BridgeMaybeSave(/*force=*/true);
+}
+
 PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                                  BanMan* banman, ChainstateManager& chainman,
                                  CTxMemPool& pool, node::Warnings& warnings, Options opts)
@@ -2840,21 +2855,26 @@ void PeerManagerImpl::BridgeInitPeer(NodeId nodeid)
     fc.tip_height = m_bridge_anchor.second;
 }
 
-void PeerManagerImpl::BridgeSaveAnchor()
+bool PeerManagerImpl::BridgeWriteAnchor(const std::pair<uint256, int>& anchor) const
 {
-    AssertLockHeld(cs_main);
-    m_bridge_anchor_dirty = false;
     const fs::path path{BridgeAnchorPath()};
     const fs::path tmp{path + ".tmp"};
-    {
-        std::ofstream out{tmp.std_path(), std::ios::trunc};
-        out << m_bridge_anchor.first.ToString() << ' ' << m_bridge_anchor.second << '\n';
-        if (!out) {
-            LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
-            return;
-        }
+    FILE* file{fsbridge::fopen(tmp, "wb")};
+    if (!file) {
+        LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
+        return false;
     }
-    if (!RenameOver(tmp, path)) LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+    const std::string line{strprintf("%s %d\n", anchor.first.ToString(), anchor.second)};
+    const bool written{std::fwrite(line.data(), 1, line.size(), file) == line.size() && FileCommit(file)};
+    if (std::fclose(file) != 0 || !written) {
+        LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    if (!RenameOver(tmp, path)) {
+        LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    return true;
 }
 
 fs::path PeerManagerImpl::BridgeHeldPath() const
@@ -2862,21 +2882,21 @@ fs::path PeerManagerImpl::BridgeHeldPath() const
     return m_chainman.m_options.datadir / BRIDGE_HELD_FILE;
 }
 
-void PeerManagerImpl::BridgeSaveHeld()
+bool PeerManagerImpl::BridgeSaveHeld()
 {
     AssertLockHeld(g_msgproc_mutex);
-    m_bridge_held_dirty = false;
     const fs::path path{BridgeHeldPath()};
     if (m_bridge_held_txs.empty() && m_bridge_recent.empty()) {
         fs::remove(path);
-        return;
+        m_bridge_held_dirty = false;
+        return true;
     }
     const fs::path tmp{path + ".tmp"};
     {
         AutoFile out{fsbridge::fopen(tmp, "wb")};
         if (out.IsNull()) {
             LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
-            return;
+            return false;
         }
         try {
             out << BRIDGE_HELD_MAGIC << BRIDGE_HELD_VERSION << m_bridge_scanned.first << m_bridge_scanned.second;
@@ -2887,12 +2907,38 @@ void PeerManagerImpl::BridgeSaveHeld()
             }
             out << static_cast<uint64_t>(m_bridge_recent.size());
             for (const auto& [txid, height] : m_bridge_recent) out << txid.ToUint256() << height;
+            // On disk before it replaces the old file, so a power cut leaves one or the other, whole.
+            if (!out.Commit()) throw std::runtime_error("cannot sync");
+            if (out.fclose() != 0) throw std::runtime_error("cannot close");
         } catch (const std::exception& e) {
             LogWarning("bridge: cannot write %s: %s\n", fs::PathToString(tmp), e.what());
-            return;
+            return false;
         }
     }
-    if (!RenameOver(tmp, path)) LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+    if (!RenameOver(tmp, path)) {
+        LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    m_bridge_held_dirty = false;
+    return true;
+}
+
+void PeerManagerImpl::BridgeMaybeSave(bool force)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    const auto [anchor, anchor_dirty]{WITH_LOCK(cs_main, return std::make_pair(m_bridge_anchor, m_bridge_anchor_dirty))};
+    if (!m_bridge_held_dirty && !anchor_dirty) return;
+    const auto now{SteadyClock::now()};
+    if (!force && now - m_bridge_saved_at < BRIDGE_SAVE_INTERVAL) return;
+    m_bridge_saved_at = now;
+    // The anchor says how far Bitcoin has been fed, so it must never be on disk ahead of the queue holding what those
+    // blocks left behind: the queue is written and synced first, and the anchor only once that has succeeded. A crash
+    // in between re-feeds a block, which is harmless -- nothing tracked is fed twice.
+    if (m_bridge_held_dirty && !BridgeSaveHeld()) return;
+    if (anchor_dirty && BridgeWriteAnchor(anchor)) {
+        LOCK(cs_main);
+        if (m_bridge_anchor == anchor) m_bridge_anchor_dirty = false;
+    }
 }
 
 void PeerManagerImpl::BridgeLoadHeld()
@@ -2956,9 +3002,9 @@ void PeerManagerImpl::BridgeLoadHeld()
             }
         }
     } catch (const std::exception& e) {
-        // Only the tail is lost, and it is lost for good: the anchor has passed those blocks, so they are
-        // not fed again (a rewind -- removing bridgefeed.dat -- is the recovery). The file is written to a
-        // temporary and renamed over, so a crash mid-write cannot cause this; only damage to the file can.
+        // Only the tail is lost, and it is lost for good: the anchor has passed those blocks, so they are not fed
+        // again (a rewind -- removing bridgefeed.dat -- is the recovery). The file is synced to a temporary and renamed
+        // over, so neither a crash nor a power cut mid-write can cause this; only damage to the file can.
         LogWarning("bridge: %s is unreadable past %u transactions: %s\n",
                    fs::PathToString(BridgeHeldPath()), m_bridge_held_txs.size(), e.what());
     }
@@ -3530,6 +3576,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
     } else {
         LogDebug(BCLog::MEMPOOL, "bridge: retry pass: nothing accepted, %s\n", summary);
     }
+    BridgeMaybeSave(/*force=*/false);
 }
 
 bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::shared_ptr<const CBlock>& block)
@@ -3632,10 +3679,9 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
     LogInfo("bridge: Bitcoin block %s (height %d, peer=%d): %u tx, %d accepted, %d already known, %d missing inputs, %d held, %d other%s\n",
             hash.ToString(), height, pfrom.GetId(), block->vtx.size() - 1, accepted, known, missing, held, other, detail);
 
-    LOCK(cs_main);
-    BridgeMarkProcessed(pfrom.GetId(), hash);
-    if (m_bridge_anchor_dirty) BridgeSaveAnchor();
-    if (m_bridge_held_dirty) BridgeSaveHeld();
+    WITH_LOCK(cs_main, BridgeMarkProcessed(pfrom.GetId(), hash));
+    // Outside cs_main -- the queue can run to a hundred MB -- and at most every BRIDGE_SAVE_INTERVAL.
+    BridgeMaybeSave(/*force=*/false);
     return true;
 }
 
