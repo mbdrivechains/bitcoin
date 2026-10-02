@@ -35,6 +35,15 @@ jobs:
           ref: ${{ inputs.tag }}
           persist-credentials: false
 
+      - name: Newest Xcode
+        # Core 31 needs C++20 features that Xcode 15's clang lacks (parenthesised aggregate init); pick the newest
+        # Xcode the runner has (16 or later).
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | grep -E 'Xcode_(1[6-9]|2[0-9])' | sort -V | tail -1)
+          [ -n "$X" ] || { echo "no Xcode 16+ on this runner"; ls -d /Applications/Xcode*; exit 1; }
+          sudo xcode-select -s "$X"
+          xcodebuild -version; clang --version | head -1
+
       - name: Tools
         # depends wants llvm-ar/-nm/-ranlib/-strip; Homebrew's llvm provides them. It goes AFTER /usr/bin in PATH so
         # clang stays Apple's (which links with the system ld64).
