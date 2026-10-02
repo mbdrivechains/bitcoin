@@ -110,7 +110,9 @@ jobs:
         run: |
           FAIL=0
           for b in bitcoin-${TAG}/bin/*; do
-            BAD=$(otool -L "$b" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
+            # Library lines are indented; the unindented lines are per-CPU headers of the universal binary.
+            otool -L "$b"
+            BAD=$(otool -L "$b" | grep -E '^\s' | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
             [ -z "$BAD" ] || { echo "NON-PORTABLE: $b"; echo "$BAD"; FAIL=1; }
           done
           exit $FAIL
