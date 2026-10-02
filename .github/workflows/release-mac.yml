@@ -1,0 +1,134 @@
+name: release-mac
+
+# Builds a universal (Apple Silicon + Intel) macOS tarball of an existing tag and attaches it, attested, to that
+# tag's GitHub release, adding its line to SHA256SUMS.
+#   gh workflow run release-mac.yml -R mbdrivechains/bitcoin -f tag=<tag>
+# Each CPU is built natively on its own GitHub runner with Bitcoin Core's depends (static libraries, no Homebrew
+# dylibs), then the two are joined with lipo and ad-hoc signed (Apple Silicon refuses unsigned binaries).
+# The Linux tarball is a Guix build made outside this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag with a GitHub release (e.g. betanet-967000-1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-14
+            host: arm64-apple-darwin
+          - runner: macos-15-intel
+            host: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Tools
+        # depends wants llvm-ar/-nm/-ranlib/-strip; Homebrew's llvm provides them. It goes AFTER /usr/bin in PATH so
+        # clang stays Apple's (which links with the system ld64).
+        run: |
+          brew install llvm automake libtool pkg-config cmake || true
+          echo "PATH=$PATH:$(brew --prefix llvm)/bin" >> "$GITHUB_ENV"
+
+      - name: Dependencies (depends, static)
+        # On a Mac the SDK comes from Xcode instead of the extracted-SDK folder Guix uses.
+        run: |
+          SDK=$(xcrun --show-sdk-path)
+          make -C depends -j"$(sysctl -n hw.ncpu)" HOST=${{ matrix.host }} OSX_SDK="$SDK" NO_QT=1 NO_IPC=1 NO_USDT=1
+
+      - name: Build
+        run: |
+          cmake -B build --toolchain depends/${{ matrix.host }}/toolchain.cmake \
+            -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DENABLE_IPC=OFF -DWITH_ZMQ=ON -DBUILD_TESTS=ON
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+          cmake --install build --prefix "$PWD/inst" --strip
+
+      - name: Unit tests
+        run: ctest --test-dir build -j"$(sysctl -n hw.ncpu)" --output-on-failure
+
+      - name: Version smoke test
+        run: inst/bin/bitcoind -version | head -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inst-${{ matrix.host }}
+          path: inst
+
+  universal:
+    needs: build
+    runs-on: macos-14
+    permissions:
+      contents: write        # upload to the release
+      id-token: write        # build provenance (attestation)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Join the two CPUs (lipo) and ad-hoc sign
+        run: |
+          NAME="bitcoin-${TAG}"
+          mkdir -p "$NAME/bin"
+          for f in inst-arm64-apple-darwin/bin/*; do
+            b=$(basename "$f")
+            lipo -create "inst-arm64-apple-darwin/bin/$b" "inst-x86_64-apple-darwin/bin/$b" -output "$NAME/bin/$b"
+            chmod 755 "$NAME/bin/$b"
+            codesign -s - -f "$NAME/bin/$b"
+            lipo -archs "$NAME/bin/$b"
+          done
+          cp -R inst-arm64-apple-darwin/share "$NAME/" 2>/dev/null || true
+
+      - name: Portability gate (only /usr/lib and /System/Library)
+        run: |
+          FAIL=0
+          for b in bitcoin-${TAG}/bin/*; do
+            BAD=$(otool -L "$b" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
+            [ -z "$BAD" ] || { echo "NON-PORTABLE: $b"; echo "$BAD"; FAIL=1; }
+          done
+          exit $FAIL
+
+      - name: Run with Homebrew hidden (regtest start/stop)
+        run: |
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          B=bitcoin-${TAG}/bin
+          "$B/bitcoind" -version | head -1
+          D=$(mktemp -d)
+          "$B/bitcoind" -regtest -daemon -datadir="$D"
+          for i in $(seq 1 30); do "$B/bitcoin-cli" -regtest -datadir="$D" getblockchaininfo >/dev/null 2>&1 && break; sleep 1; done
+          "$B/bitcoin-cli" -regtest -datadir="$D" getblockchaininfo | head -3
+          "$B/bitcoin-cli" -regtest -datadir="$D" stop
+          sleep 3
+
+      - name: Package
+        run: |
+          F="bitcoin-${TAG}-universal-apple-darwin.tar.gz"
+          tar -czf "$F" "bitcoin-${TAG}"
+          shasum -a 256 "$F" | tee mac.sha256
+          echo "F=$F" >> "$GITHUB_ENV"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.F }}
+
+      - name: Attach to the release and update SHA256SUMS
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -O SHA256SUMS.old || : > SHA256SUMS.old
+          grep -v " $F\$" SHA256SUMS.old > SHA256SUMS || true
+          cat mac.sha256 >> SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "$F" SHA256SUMS
