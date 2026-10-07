@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = ["test_cluster_leak", "test_restart_persist", "test_package_cpfp", "test_no_expiry", "test_package_multi_parent",
          "test_ephemeral_sibling", "test_backpressure", "test_fee_skip", "test_mempool_loss", "test_known_relayed",
          "test_stale_restart", "test_mixed_dead_input", "test_crash_feed", "test_reorg_retrack", "test_gate_release",
-         "test_truc_sibling"]
+         "test_truc_sibling", "test_unpaid_anchor"]
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 lanes = int(sys.argv[sys.argv.index("--lanes") + 1]) if "--lanes" in sys.argv else 2

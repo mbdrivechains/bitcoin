@@ -30,6 +30,7 @@ its own ports, so `run_all.py` runs two at a time. Pass one or more test names t
 | `test_reorg_retrack` | a fed transaction mined here and then reorganised away is tracked again | lost | in |
 | `test_gate_release` | the catch-up gate releases when our chain will not get back to where it was | stalled | fed |
 | `test_truc_sibling` | a v3 child refused only for its parent's one child slot waits, not dropped | lost | in |
+| `test_unpaid_anchor` | a zero-fee anchor transaction whose fee payer can never go in is dropped with what waits behind it, at the feed and when the fee payer's other input dies later | 7 held | 0 |
 | `test_retry_cost` | a pass costs what can progress, not the backlog (8,000 held) | 401 ms | ~7 ms |
 
 "Before" is the build just before the commit that fixes it; `test_backpressure` uses that build with its limit compiled

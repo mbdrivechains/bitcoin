@@ -790,6 +790,11 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     /** Bridge: whether we track `txid`: waiting, fed, or mined here lately. */
     bool BridgeTracked(const Txid& txid) const EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: `tx` can never go in; note the outputs of waiting transactions it spends. */
+    void BridgeNoteDeadSpends(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+    /** Bridge: drop each waiting transaction whose dust (an anchor) was spent by one that can never go in -- its fee
+     * payer -- and everything waiting behind it. */
+    void BridgeDropUnpaid(int tip_height) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     BridgeInputs BridgeClassifyInputs(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, cs_main);
     /** Bridge: whether the node is caught up enough to judge Bitcoin transactions at all. */
     bool BridgeReady(int tip_height, int best_header_height) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
@@ -993,6 +998,8 @@ private:
     std::chrono::microseconds m_bridge_fee_rechecked_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
     /** Bridge: a fed block left a transaction below the fee floor; retry at once so a child can carry it. */
     bool m_bridge_retry_now GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Bridge: outputs of WAITING transactions that a transaction which can never go in spends, for BridgeDropUnpaid. */
+    std::map<Txid, std::vector<uint32_t>> m_bridge_dead_spends GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
     NodeId m_bridge_feed_peer GUARDED_BY(cs_main){-1};
     /** Bridge: recently fed block hashes, so a peer that learns of one later does not queue it again. */
@@ -3377,6 +3384,67 @@ bool PeerManagerImpl::BridgeTracked(const Txid& txid) const
     return m_bridge_held_txids.contains(txid) || m_bridge_fed_txids.contains(txid) || m_bridge_recent_txids.contains(txid);
 }
 
+void PeerManagerImpl::BridgeNoteDeadSpends(const CTransaction& tx)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    for (const CTxIn& in : tx.vin) {
+        if (m_bridge_held_txids.contains(in.prevout.hash)) m_bridge_dead_spends[in.prevout.hash].push_back(in.prevout.n);
+    }
+}
+
+void PeerManagerImpl::BridgeDropUnpaid(int tip_height)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    // Policy admits a transaction with dust (an anchor) only at zero fee, prioritisetransaction or not, and only in a
+    // package with a child that spends the dust. On Bitcoin that child was its fee payer. When the fee payer can never
+    // go in here -- typically it added a post-fork Bitcoin coin to pay the fee -- nothing we hold can carry the
+    // transaction: it is unpaid, and would wait forever with everything behind it. (Anyone can still put it in here
+    // with a new fee payer: an anchor is spendable by anyone.) Dropped at once, not at the next pass, so that no save
+    // of the queue can keep it after the fee payer is gone.
+    int unpaid{0}, behind{0};
+    while (!m_bridge_dead_spends.empty()) {
+        std::map<Txid, std::vector<uint32_t>> spends;
+        std::swap(spends, m_bridge_dead_spends);
+        std::unordered_set<Txid, SaltedTxidHasher> gone;
+        std::deque<BridgeHeld> kept;
+        for (BridgeHeld& entry : m_bridge_held_txs) {
+            const CTransaction& tx{*entry.tx};
+            bool drop{false};
+            if (entry.state == BridgeState::WAITING) {
+                if (const auto it{spends.find(tx.GetHash())}; it != spends.end()) {
+                    for (const uint32_t n : it->second) {
+                        if (n < tx.vout.size() && IsDust(tx.vout[n], m_mempool.m_opts.dust_relay_feerate)) drop = true;
+                    }
+                    if (drop) ++unpaid;
+                }
+                if (!drop && std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& in) { return gone.contains(in.prevout.hash); })) {
+                    drop = true;
+                    ++behind;
+                }
+            }
+            if (!drop) {
+                kept.push_back(std::move(entry));
+                continue;
+            }
+            gone.insert(tx.GetHash());
+            m_bridge_held_txids.erase(tx.GetHash());
+            BridgeNoteDeadSpends(tx); // it may in turn have been the fee payer of another waiting transaction
+        }
+        m_bridge_held_txs = std::move(kept);
+    }
+    if (unpaid + behind == 0) return;
+    m_bridge_held_weight = 0;
+    m_bridge_young_weight = 0;
+    for (const BridgeHeld& entry : m_bridge_held_txs) {
+        if (entry.state != BridgeState::WAITING) continue;
+        m_bridge_held_weight += entry.weight;
+        if (entry.since_height > tip_height - BRIDGE_HELD_YOUNG_BLOCKS) m_bridge_young_weight += entry.weight;
+    }
+    m_bridge_held_dirty = true;
+    LogInfo("bridge: dropped %d held Bitcoin transactions whose fee payer can never go in, and %d waiting behind them\n",
+            unpaid, behind);
+}
+
 PeerManagerImpl::BridgeInputs PeerManagerImpl::BridgeClassifyInputs(const CTransaction& tx)
 {
     AssertLockHeld(g_msgproc_mutex);
@@ -3583,6 +3651,11 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                     if (in.contains(txid)) {
                         next = BridgeState::FED;
                         ++packaged;
+                    } else if (WITH_LOCK(cs_main, return BridgeClassifyInputs(*tx)) == BridgeInputs::DEAD) {
+                        // Another input has since gone (a parent dropped): it can never go in, nor pay for them.
+                        next.reset();
+                        ++dropped;
+                        BridgeNoteDeadSpends(*tx);
                     }
                 }
             } else if (!was_fed && !recheck_fees && entry.feerate && *entry.feerate < floor && !m_mempool.exists(txid)) {
@@ -3620,6 +3693,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
                 case BridgeTxResult::MISSING:
                 case BridgeTxResult::OTHER:
                     ++dropped;
+                    BridgeNoteDeadSpends(*tx);
                     break;
                 }
             }
@@ -3638,6 +3712,7 @@ void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
         held.push_back(std::move(entry));
     }
     m_bridge_held_txs = std::move(held);
+    if (!m_bridge_dead_spends.empty()) BridgeDropUnpaid(tip_height);
     m_bridge_held_weight = 0;
     m_bridge_young_weight = 0;
     std::optional<std::chrono::microseconds> oldest;
@@ -3731,6 +3806,7 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
             }
             if (inputs == BridgeInputs::DEAD) {
                 ++missing;
+                BridgeNoteDeadSpends(*tx);
                 continue;
             }
             if (inputs == BridgeInputs::WAITS) {
@@ -3753,6 +3829,7 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
             break;
         case BridgeTxResult::MISSING:
             ++missing;
+            BridgeNoteDeadSpends(*tx);
             break;
         case BridgeTxResult::HELD:
             ++held;
@@ -3764,9 +3841,11 @@ bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::sh
         case BridgeTxResult::OTHER:
             ++other;
             ++reasons[reason];
+            BridgeNoteDeadSpends(*tx);
             break;
         }
     }
+    if (!m_bridge_dead_spends.empty()) BridgeDropUnpaid(tip_height);
     std::string detail;
     for (const auto& [reason, n] : reasons) detail += strprintf(" %s=%d", reason, n);
     LogInfo("bridge: Bitcoin block %s (height %d, peer=%d): %u tx, %d accepted, %d already known, %d missing inputs, %d held, %d other%s\n",
