@@ -8,7 +8,7 @@ fed, X is fed again and Y follows.
 
 Usage: test_known_relayed.py [<ecx-bitcoind>]      exit 0 = both arrived, 1 = lost
 """
-import sys, time
+import re, sys, time
 from bridgelib import Pair, wait_for, result
 
 pair = Pair("known-relayed", ecx=(sys.argv[1] if len(sys.argv) > 1 else None), base=18710,
@@ -21,9 +21,16 @@ try:
     B.rpc("sendrawtransaction", x["hex"])                  # another route got there first
     pair.wait_fed(pair.mine_bitcoin([x["hex"]]))
     print("X relayed to B first; Bitcoin's block with X fed after it")
+    logged = len(B.log())
     B.restart()
-    assert not B.has(x["txid"]), "the mempool survived the restart; the test proves nothing"
-    print("B restarted without its mempool: X is gone")
+    if B.has(x["txid"]):
+        # The bridge's first pass after startup can feed X again before we look. Then the log since the restart says
+        # so; if it doesn't, the mempool survived and the test would prove nothing.
+        refed = [int(n) for n in re.findall(r"(\d+) fed again after being lost", B.log()[logged:])]
+        assert refed and max(refed) >= 1, "the mempool survived the restart; the test proves nothing"
+        print("B restarted without its mempool; the bridge has already fed X again")
+    else:
+        print("B restarted without its mempool: X is gone")
     y = pair.spend([pair.out(x)], [(pair.addr, x["vout"][0]["amount"] - 0.0001)])
     pair.wait_fed(pair.mine_bitcoin([y["hex"]]))
     for i in range(5):
