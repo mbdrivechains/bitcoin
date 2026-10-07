@@ -10,7 +10,7 @@ transactions are tracked until they confirm, and one that vanishes is offered ag
 
 Usage: test_mempool_loss.py [<ecx-bitcoind>]      exit 0 = both arrived, 1 = lost
 """
-import sys, time
+import re, sys, time
 from bridgelib import Pair, wait_for, result
 
 pair = Pair("mempool-loss", ecx=(sys.argv[1] if len(sys.argv) > 1 else None), base=18650,
@@ -24,9 +24,16 @@ try:
     wait_for(lambda: B.has(x["txid"]), "X accepted into B's mempool")
     print("X fed and in B's mempool")
 
+    logged = len(B.log())
     B.restart()                                   # -persistmempool=0: it comes back with nothing
-    assert not B.has(x["txid"]), "the mempool survived the restart; the test proves nothing"
-    print("B restarted without its mempool: X is gone")
+    if B.has(x["txid"]):
+        # The bridge's first pass after startup can feed X again before we look. Then the log since the restart says
+        # so; if it doesn't, the mempool survived and the test would prove nothing.
+        refed = [int(n) for n in re.findall(r"(\d+) fed again after being lost", B.log()[logged:])]
+        assert refed and max(refed) >= 1, "the mempool survived the restart; the test proves nothing"
+        print("B restarted without its mempool; the bridge has already fed X again")
+    else:
+        print("B restarted without its mempool: X is gone")
 
     y = pair.spend([pair.out(x)], [(pair.addr, x["vout"][0]["amount"] - 0.0001)])
     pair.wait_fed(pair.mine_bitcoin([y["hex"]]))
