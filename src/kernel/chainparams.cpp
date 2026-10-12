@@ -510,25 +510,27 @@ public:
         pchMessageStart[0] = 0xea;
         pchMessageStart[1] = 0x5e;
         pchMessageStart[2] = 0x4e;
-        pchMessageStart[3] = 0x02; // reset 2026-10-12: every block mined through the enforcer
+        pchMessageStart[3] = 0x03; // reset 2026-10-13: genesis at difficulty 0.28 (about 2-minute blocks at 10 MH/s)
         nDefaultPort = 28533;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 1;
         m_assumed_chain_state_size = 1;
 
-        // Bitcoin block 971,071: this easynet (the second, magic ...02) was started after it.
-        const char* easynet_genesis_msg = "12/Oct/2026 easynet2 00000000000000000000b59b7ff59e56f215fe8850226c676aac64f5650b28cf";
+        // Bitcoin block 971,144: this easynet (the third, magic ...03) was started after it. Its genesis is at
+        // difficulty 0.28 (bits 0x1d03943d), about 2-minute blocks at 10 MH/s (Michael 2026-10-13), so the first
+        // 2016 blocks run fast and the switch to ASERT at block 2016 comes about 2.8 days after the start.
+        const char* easynet_genesis_msg = "13/Oct/2026 easynet3 00000000000000000001ef6128bde202062f4f3c0ad73c6993e0a7f4941bc924";
         const CScript easynet_genesis_script = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
         genesis = CreateGenesisBlock(easynet_genesis_msg,
                 easynet_genesis_script,
-                1791796552,
-                10077315,
-                0x1e00ffff,
+                1791842504,
+                1046346704,
+                0x1d03943d,
                 1,
                 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000176912491d8e7a1674f03f66896e6a0043a54354b3528838f571bf8acd"});
-        assert(genesis.hashMerkleRoot == uint256{"09fc7b10bb505c244b941e7e803312d517dfbb390fd3c097cf56ae7a2e95f1ea"});
+        assert(consensus.hashGenesisBlock == uint256{"00000001a4105dc30c636e71ac2d844caa32d6fa2e9aacc5b2225ea772dd9490"});
+        assert(genesis.hashMerkleRoot == uint256{"31d7969b1c60f72a9390ce11c927e475ff03a1be8b382e20a2b6dcaed16b9a9b"});
 
         vFixedSeeds.clear();
         vSeeds.clear(); // no DNS seed: the fixed seed below, or -addnode
