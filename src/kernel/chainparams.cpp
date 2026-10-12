@@ -510,25 +510,25 @@ public:
         pchMessageStart[0] = 0xea;
         pchMessageStart[1] = 0x5e;
         pchMessageStart[2] = 0x4e;
-        pchMessageStart[3] = 0x01;
+        pchMessageStart[3] = 0x02; // reset 2026-10-12: every block mined through the enforcer
         nDefaultPort = 28533;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 1;
         m_assumed_chain_state_size = 1;
 
-        // Bitcoin block 971,056: easynet was started after it.
-        const char* easynet_genesis_msg = "12/Oct/2026 easynet 00000000000000000000c66d99e32a6ab0ff659a50365d8827858bfb837db668";
+        // Bitcoin block 971,071: this easynet (the second, magic ...02) was started after it.
+        const char* easynet_genesis_msg = "12/Oct/2026 easynet2 00000000000000000000b59b7ff59e56f215fe8850226c676aac64f5650b28cf";
         const CScript easynet_genesis_script = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
         genesis = CreateGenesisBlock(easynet_genesis_msg,
                 easynet_genesis_script,
-                1791788456,
-                4894467,
+                1791796552,
+                10077315,
                 0x1e00ffff,
                 1,
                 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000084a9f03ba2184e5803979f595f4c55f75e01f580274b6cdd72380fd462"});
-        assert(genesis.hashMerkleRoot == uint256{"020fa973c77a1348a11f7202549fac04601cccd4a45be1d916723ee0c3f34680"});
+        assert(consensus.hashGenesisBlock == uint256{"000000176912491d8e7a1674f03f66896e6a0043a54354b3528838f571bf8acd"});
+        assert(genesis.hashMerkleRoot == uint256{"09fc7b10bb505c244b941e7e803312d517dfbb390fd3c097cf56ae7a2e95f1ea"});
 
         vFixedSeeds.clear();
         vSeeds.clear(); // no DNS seed: the fixed seed below, or -addnode
