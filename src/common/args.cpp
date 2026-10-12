@@ -160,6 +160,7 @@ std::list<SectionInfo> ArgsManager::GetUnrecognizedSections() const
         ChainTypeToString(ChainType::TESTNET),
         ChainTypeToString(ChainType::TESTNET4),
         ChainTypeToString(ChainType::MAIN),
+        ChainTypeToString(ChainType::EASYNET),
     };
 
     LOCK(cs_args);
@@ -848,7 +849,8 @@ std::variant<ChainType, std::string> ArgsManager::GetChainArg() const
     if (fSigNet) return ChainType::SIGNET;
     if (fTestNet) return ChainType::TESTNET;
     if (fTestNet4) return ChainType::TESTNET4;
-    return ChainType::MAIN;
+    // easynet build: one public network, started with no flag (-chain=main still selects eCash mainnet).
+    return ChainType::EASYNET;
 }
 
 bool ArgsManager::UseDefaultSection(const std::string& arg) const

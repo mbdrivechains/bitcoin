@@ -51,6 +51,8 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain)
         return std::make_unique<CBaseChainParams>("signet", 38532);
     case ChainType::REGTEST:
         return std::make_unique<CBaseChainParams>("regtest", 18643);
+    case ChainType::EASYNET:
+        return std::make_unique<CBaseChainParams>("easynet", 28532);
     }
     assert(false);
 }

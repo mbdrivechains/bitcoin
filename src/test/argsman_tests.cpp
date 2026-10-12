@@ -657,11 +657,12 @@ BOOST_AUTO_TEST_CASE(util_GetChainTypeString)
     const char* testnetconf = "testnet4=1\nregtest=0\n[testnet4]\nregtest=1";
     std::string error;
 
+    // easynet build: with no network flag the node starts on easynet, not main.
     BOOST_CHECK(test_args.ParseParameters(0, argv_testnet4, error));
-    BOOST_CHECK_EQUAL(test_args.GetChainTypeString(), "main");
+    BOOST_CHECK_EQUAL(test_args.GetChainTypeString(), "easynet");
 
     BOOST_CHECK(test_args.ParseParameters(0, argv_testnet4, error));
-    BOOST_CHECK_EQUAL(test_args.GetChainTypeString(), "main");
+    BOOST_CHECK_EQUAL(test_args.GetChainTypeString(), "easynet");
 
     BOOST_CHECK(test_args.ParseParameters(2, argv_testnet4, error));
     BOOST_CHECK_EQUAL(test_args.GetChainTypeString(), "testnet4");
@@ -1019,7 +1020,9 @@ BOOST_FIXTURE_TEST_CASE(util_ChainMerge, ChainMergeTestingSetup)
     // Results file is formatted like:
     //
     //   <input> || <output>
-    BOOST_CHECK_EQUAL(out_sha_hex, "c0e33aab0c74e040ddcee9edad59e8148d8e1cacb3cccd9ea1a1f485cb6bad21");
+    // easynet build: the dump differs from eCash master's only where no network is chosen ("|| main" became
+    // "|| easynet"); checked 2026-10-12 by diffing both dumps with that one word normalised.
+    BOOST_CHECK_EQUAL(out_sha_hex, "95a727751064080f570b689e8fd478add0c457a7e73cdfc87b88363e05467619");
 }
 
 BOOST_AUTO_TEST_CASE(util_ReadWriteSettings)

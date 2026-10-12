@@ -74,7 +74,7 @@ static void SetupCliArgs(ArgsManager& argsman)
 {
     SetupHelpOptions(argsman);
 
-    const auto defaultBaseParams = CreateBaseChainParams(ChainType::MAIN);
+    const auto defaultBaseParams = CreateBaseChainParams(ChainType::EASYNET);
     const auto testnetBaseParams = CreateBaseChainParams(ChainType::TESTNET);
     const auto testnet4BaseParams = CreateBaseChainParams(ChainType::TESTNET4);
     const auto signetBaseParams = CreateBaseChainParams(ChainType::SIGNET);
@@ -428,6 +428,8 @@ private:
         switch (gArgs.GetChainType()) {
         case ChainType::TESTNET4:
             return " testnet4";
+        case ChainType::EASYNET:
+            return " easynet";
         case ChainType::TESTNET:
             return " testnet";
         case ChainType::SIGNET:

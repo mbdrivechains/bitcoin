@@ -502,12 +502,17 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
     BOOST_CHECK(!over);
     BOOST_CHECK(UintToArith256(consensus.powLimit) >= pow_compact);
 
-    // an ASERT anchor needs a parent block, a positive half-life, no min-difficulty blocks, and a
+    // an ASERT anchor needs a parent block, a positive half-life, a min-difficulty-safe anchor, and a
     // powLimit below 2^239 so refTarget * factor (< 2^17) fits -- see pow.cpp:CalculateASERT()
     if (consensus.EcashAsertAnchorHeight != 0) {
         BOOST_CHECK(consensus.EcashAsertAnchorHeight >= 1);
         BOOST_CHECK(consensus.EcashAsertHalfLife > 0);
-        BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+        // With min-difficulty blocks (the 20-minute rule) the anchor must be a retarget block, which
+        // can never be one of them: a multiple of the interval, with BIP94's first-block rule on.
+        if (consensus.fPowAllowMinDifficultyBlocks) {
+            BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight % consensus.DifficultyAdjustmentInterval(), 0);
+            BOOST_CHECK(consensus.enforce_BIP94);
+        }
         BOOST_CHECK((UintToArith256(consensus.powLimit) >> 239) == 0);
     }
 
@@ -565,6 +570,58 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::TESTNET4);
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_EASYNET_sanity)
+{
+    sanity_check_chainparams(*m_node.args, ChainType::EASYNET);
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::EASYNET)->GetConsensus();
+    BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight, 2016);
+    BOOST_CHECK_EQUAL(consensus.EcashAsertHalfLife, ASERT_SPEC_HALF_LIFE);
+    BOOST_CHECK(consensus.fPowAllowMinDifficultyBlocks);
+}
+
+// easynet: the 20-minute rule under ASERT. A late block may be mined at powLimit, and a min-difficulty
+// parent leaves the next normal block's target exactly where it would have been (ASERT reads only the
+// anchor and the parent's height and time, never the parent's nBits).
+BOOST_AUTO_TEST_CASE(easynet_twenty_minute_rule_under_asert)
+{
+    const auto chainParams = CreateChainParams(*m_node.args, ChainType::EASYNET);
+    const auto& params = chainParams->GetConsensus();
+    const int anchor = params.EcashAsertAnchorHeight;
+    const uint32_t pow_limit_bits = UintToArith256(params.powLimit).GetCompact();
+    const arith_uint256 normal_target{UintToArith256(params.powLimit) >> 10};
+    const uint32_t normal_bits = normal_target.GetCompact();
+    const int64_t t0 = chainParams->GenesisBlock().nTime;
+
+    std::vector<CBlockIndex> blocks(anchor + 10);
+    for (int i = 0; i < (int)blocks.size(); i++) {
+        blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
+        blocks[i].nHeight = i;
+        blocks[i].nTime = t0 + i * params.nPowTargetSpacing;
+        blocks[i].nBits = normal_bits;
+    }
+    const CBlockIndex* tip = &blocks.back();
+    BOOST_REQUIRE(IsAsertHeight(params, tip->nHeight + 1));
+
+    CBlockHeader on_time, late;
+    on_time.nTime = tip->nTime + params.nPowTargetSpacing;
+    late.nTime = tip->nTime + params.nPowTargetSpacing * 2 + 1;
+    // On schedule, ASERT keeps the anchor's target; one second past 20 minutes is a min-difficulty block.
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &on_time, params), normal_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &late, params), pow_limit_bits);
+    // Exactly 20 minutes is not late.
+    CBlockHeader edge;
+    edge.nTime = tip->nTime + params.nPowTargetSpacing * 2;
+    BOOST_CHECK(GetNextWorkRequired(tip, &edge, params) != pow_limit_bits);
+
+    // Path independence: the same tip time and height, once with a normal parent and once with a
+    // min-difficulty parent, give the next block the same target.
+    CBlockHeader next;
+    next.nTime = tip->nTime + params.nPowTargetSpacing;
+    const uint32_t with_normal_parent = GetNextWorkRequired(tip, &next, params);
+    blocks.back().nBits = pow_limit_bits;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &next, params), with_normal_parent);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)

@@ -455,6 +455,111 @@ public:
 };
 
 /**
+ * Easynet: a public, CPU-mineable test network on eCash's rules, run by mbdrivechains. It starts under the
+ * 2016-block rule and switches to ASERT (aserti3-2d) at a published height, to rehearse that flag day on a live
+ * chain. It keeps the testnet 20-minute rule. Not eCash's own network.
+ */
+class CEasyNetParams : public CChainParams {
+public:
+    CEasyNetParams() {
+        m_chain_type = ChainType::EASYNET;
+        consensus.signet_blocks = false;
+        consensus.signet_challenge.clear();
+        consensus.nSubsidyHalvingInterval = 210000;
+        consensus.BIP34Height = 1;
+        consensus.BIP34Hash = uint256{};
+        consensus.BIP65Height = 1;
+        consensus.BIP66Height = 1;
+        consensus.CSVHeight = 1;
+        consensus.SegwitHeight = 1;
+        consensus.MinBIP9WarningHeight = 0;
+        // 2^232: a minimum-difficulty block is 2^24 hashes, under a second on one CPU, so a CPU-mined chain sits well
+        // above the floor and ASERT has room to move. Below the old rule's overflow bound (about 2^233).
+        consensus.powLimit = uint256{"000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
+        consensus.nPowTargetSpacing = 10 * 60;
+        consensus.fPowAllowMinDifficultyBlocks = true; // the testnet 20-minute rule, also under ASERT (as Bitcoin ABC)
+        consensus.enforce_BIP94 = true;                 // timewarp rule from genesis; min-difficulty-safe retargets
+        consensus.fPowNoRetargeting = false;
+        // No fork from Bitcoin: no fork height, no forced fork difficulty.
+        consensus.EcashHeight = 0;
+        consensus.EcashForkBits = 0;
+        // The flag day (Michael 2026-10-12: "at end of first epoch"): the anchor is block 2016, the first retarget
+        // block, so it can never be a 20-minute (min-difficulty) block; ASERT sets every block from 2017 on.
+        consensus.EcashAsertAnchorHeight = 2016;
+        consensus.EcashAsertHalfLife = 2 * 24 * 60 * 60; // two days, as proposed for eCash
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = 2016;
+
+        consensus.nMinimumChainWork = uint256{};
+        consensus.defaultAssumeValid = uint256{};
+
+        // A reset changes the last byte (01, 02, ...) so nodes of an old easynet never mix with a new one.
+        pchMessageStart[0] = 0xea;
+        pchMessageStart[1] = 0x5e;
+        pchMessageStart[2] = 0x4e;
+        pchMessageStart[3] = 0x01;
+        nDefaultPort = 28533;
+        nPruneAfterHeight = 1000;
+        m_assumed_blockchain_size = 1;
+        m_assumed_chain_state_size = 1;
+
+        // Bitcoin block 971,056: easynet was started after it.
+        const char* easynet_genesis_msg = "12/Oct/2026 easynet 00000000000000000000c66d99e32a6ab0ff659a50365d8827858bfb837db668";
+        const CScript easynet_genesis_script = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
+        genesis = CreateGenesisBlock(easynet_genesis_msg,
+                easynet_genesis_script,
+                1791788456,
+                4894467,
+                0x1e00ffff,
+                1,
+                50 * COIN);
+        consensus.hashGenesisBlock = genesis.GetHash();
+        assert(consensus.hashGenesisBlock == uint256{"00000084a9f03ba2184e5803979f595f4c55f75e01f580274b6cdd72380fd462"});
+        assert(genesis.hashMerkleRoot == uint256{"020fa973c77a1348a11f7202549fac04601cccd4a45be1d916723ee0c3f34680"});
+
+        vFixedSeeds.clear();
+        vSeeds.clear(); // no DNS seed: the fixed seed below, or -addnode
+        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_easynet), std::end(chainparams_seed_easynet));
+
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
+        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
+        base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
+        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+
+        bech32_hrp = "tb";
+
+        fDefaultConsistencyChecks = false;
+        m_is_mockable_chain = false;
+
+        chainTxData = ChainTxData{
+            .nTime = 0,
+            .tx_count = 0,
+            .dTxRate = 0.001,
+        };
+
+        // Copied from Testnet4, as regtest does.
+        m_headers_sync_params = HeadersSyncParams{
+            .commitment_period = 275,
+            .redownload_buffer_size = 7017, // 7017/275 = ~25.5 commitments
+        };
+    }
+};
+
+/**
  * Signet: test network with an additional consensus parameter (see BIP325).
  */
 class SigNetParams : public CChainParams {
@@ -786,6 +891,11 @@ std::unique_ptr<const CChainParams> CChainParams::TestNet4()
     return std::make_unique<const CTestNet4Params>();
 }
 
+std::unique_ptr<const CChainParams> CChainParams::EasyNet()
+{
+    return std::make_unique<const CEasyNetParams>();
+}
+
 std::vector<int> CChainParams::GetAvailableSnapshotHeights() const
 {
     std::vector<int> heights;
@@ -804,6 +914,7 @@ std::optional<ChainType> GetNetworkForMagic(const MessageStartChars& message)
     const auto testnet4_msg = CChainParams::TestNet4()->MessageStart();
     const auto regtest_msg = CChainParams::RegTest({})->MessageStart();
     const auto signet_msg = CChainParams::SigNet({})->MessageStart();
+    const auto easynet_msg = CChainParams::EasyNet()->MessageStart();
 
     if (std::ranges::equal(message, mainnet_msg)) {
         return ChainType::MAIN;
@@ -815,6 +926,8 @@ std::optional<ChainType> GetNetworkForMagic(const MessageStartChars& message)
         return ChainType::REGTEST;
     } else if (std::ranges::equal(message, signet_msg)) {
         return ChainType::SIGNET;
+    } else if (std::ranges::equal(message, easynet_msg)) {
+        return ChainType::EASYNET;
     }
     return std::nullopt;
 }

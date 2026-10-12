@@ -18,9 +18,15 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
     assert(pindexLast != nullptr);
 
     // ASERT takes over for every block above the anchor. Chains that never retarget keep
-    // not retargeting; the anchor is only meaningful on chains without min-difficulty
-    // blocks (enforced by the chainparams sanity test).
+    // not retargeting. On a chain with min-difficulty blocks the anchor must be a retarget
+    // block (a multiple of the interval, enforce_BIP94 on), so it is never one of them.
     if (!params.fPowNoRetargeting && IsAsertHeight(params, pindexLast->nHeight + 1)) {
+        // easynet: the testnet 20-minute rule also applies under ASERT, as in Bitcoin ABC (aserti32d.cpp). ASERT
+        // reads only the anchor and the parent block, never these blocks' nBits, so they leave its schedule alone.
+        if (params.fPowAllowMinDifficultyBlocks &&
+            pblock->GetBlockTime() > pindexLast->GetBlockTime() + params.nPowTargetSpacing * 2) {
+            return UintToArith256(params.powLimit).GetCompact();
+        }
         const CBlockIndex* pindexAnchor = pindexLast->GetAncestor(params.EcashAsertAnchorHeight);
         assert(pindexAnchor != nullptr);
         return GetNextASERTWorkRequired(pindexLast, pindexAnchor, params);
