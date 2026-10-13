@@ -8,6 +8,27 @@ experiments, and **it can be restarted at any time**.
 - Public pool: `stratum+tcp://seed.ecxfreebank.com:28334`
 - Downloads: https://github.com/mbdrivechains/bitcoin/releases (the newest `easynet-N` release)
 
+## Quick install (one command)
+
+```
+curl -fsSL https://raw.githubusercontent.com/mbdrivechains/bitcoin/easynet/contrib/easynet/easynet.sh | bash
+```
+
+This downloads the newest release for your system (Linux x86_64 or macOS 14+), checks it against the release's
+`SHA256SUMS`, and starts a node and the enforcer, all inside `~/easynet` (an eCash node you already run is not
+touched). Nothing runs as root and nothing starts at boot. Afterwards:
+
+```
+~/easynet/easynet status      # what is running, block height, peers
+~/easynet/easynet address     # an address to mine to, and the miner command
+~/easynet/easynet stop        # and: start
+~/easynet/easynet update      # the newest release; after an easynet reset it moves the old chain aside
+~/easynet/easynet remove      # stop everything and delete ~/easynet
+```
+
+To read the script before running it: `curl -fsSLO <the URL above>`, read `easynet.sh`, then `bash easynet.sh`.
+Steps 1 to 4 below do the same by hand.
+
 ## The network now (reset 3, 2026-10-13, release `easynet-3`)
 
 | | |
@@ -74,11 +95,11 @@ Create the config file (the folder too, if it is not there) with:
 [easynet]
 server=1
 txindex=1
-zmqpubsequence=tcp://127.0.0.1:28534
+zmqpubsequence=tcp://127.0.0.1:28535
 ```
 
 `server` lets `bitcoin-cli` and the enforcer talk to the node; `txindex` and `zmqpubsequence` are what the enforcer
-needs (step 4). Then:
+needs (step 4). Keep ZMQ off port 28534: the node uses that one itself (for Tor), right after its P2P port. Then:
 
 ```
 bitcoind -daemon
@@ -116,7 +137,7 @@ With the node from step 2 running, start it. On Linux:
 ```
 bip300301_enforcer --network-preset=easynet \
   --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path=$HOME/.ecash/easynet/.cookie \
-  --node-zmq-addr-sequence=tcp://127.0.0.1:28534 \
+  --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
   --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
   --bitcoin-core-skip-version-check
 ```
@@ -126,7 +147,7 @@ On macOS, the same with the node's cookie in its macOS folder:
 ```
 bip300301_enforcer --network-preset=easynet \
   --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$HOME/Library/Application Support/eCash/easynet/.cookie" \
-  --node-zmq-addr-sequence=tcp://127.0.0.1:28534 \
+  --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
   --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
   --bitcoin-core-skip-version-check
 ```
