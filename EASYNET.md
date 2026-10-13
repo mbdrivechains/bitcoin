@@ -6,10 +6,9 @@ experiments, and **it can be restarted at any time**.
 
 - Explorer: https://easy.ecxfreebank.com
 - Public pool: `stratum+tcp://seed.ecxfreebank.com:28334`
-- Downloads: the latest `easynet-N` release at https://github.com/mbdrivechains/bitcoin/releases (node for Linux
-  x86_64 and macOS, enforcer for Linux x86_64), or build this branch.
+- Downloads: https://github.com/mbdrivechains/bitcoin/releases (the newest `easynet-N` release)
 
-## The network now (reset 3, 2026-10-13)
+## The network now (reset 3, 2026-10-13, release `easynet-3`)
 
 | | |
 |---|---|
@@ -22,36 +21,54 @@ experiments, and **it can be restarted at any time**.
 Blocks come about every two minutes at the start (genesis difficulty 0.28 against about 10 MH/s of CPU mining). At
 block 2016 the difficulty retargets, and from block 2017 ASERT (half-life two days) steers it toward 10-minute blocks.
 
-**Resets.** A reset brings a new genesis, and the last byte of the magic goes up by one. The release tag follows it
-(`easynet-3` is reset 3). After a reset, take the new release and start from empty data directories (move
-`~/.ecash/easynet` and the enforcer's data directory aside).
+## 1. Download
 
-## Run a node
+Each release has the node (`bitcoind`, `bitcoin-cli`, ...) and the enforcer, for Linux x86_64 (glibc 2.31 or newer,
+e.g. Ubuntu 20.04 and later) and macOS 14 or newer (one universal file for Apple Silicon and Intel).
+
+**Linux:**
+
+```
+T=easynet-3
+U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
+curl -LO $U/bitcoin-$T-x86_64-linux-gnu.tar.gz
+curl -LO $U/bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
+curl -LO $U/SHA256SUMS
+grep x86_64-linux-gnu SHA256SUMS | sha256sum -c
+tar -xzf bitcoin-$T-x86_64-linux-gnu.tar.gz
+tar -xzf bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
+```
+
+**macOS:**
+
+```
+T=easynet-3
+U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
+curl -LO $U/bitcoin-$T-universal-apple-darwin.tar.gz
+curl -LO $U/bip300301_enforcer-$T-universal-apple-darwin.tar.gz
+curl -LO $U/SHA256SUMS
+grep apple-darwin SHA256SUMS | shasum -a 256 -c
+tar -xzf bitcoin-$T-universal-apple-darwin.tar.gz
+tar -xzf bip300301_enforcer-$T-universal-apple-darwin.tar.gz
+```
+
+The macOS binaries are signed ad hoc, not notarised by Apple. Downloaded with `curl` as above they run as they are.
+If you downloaded them in a browser, macOS refuses to open them; clear the download flag first:
+`xattr -dr com.apple.quarantine bitcoin-easynet-3 bip300301_enforcer-easynet-3-universal-apple-darwin`.
+
+The node's programs are in `bitcoin-easynet-3/bin/`; the enforcer is in the `bip300301_enforcer-easynet-3-...`
+folder. The commands below assume you add both to your `PATH`, or type the paths.
+
+## 2. Start a node
 
 This build's one network is easynet: `bitcoind` starts it with no flag. (`-chain=main` still selects eCash mainnet.)
-Data directory `~/.ecash/easynet`, config file `~/.ecash/ecash.conf`. It finds the seed by itself.
 
-```
-bitcoind -daemon
-bitcoin-cli getblockchaininfo        # "chain": "easynet"
-```
+| | Linux | macOS |
+|---|---|---|
+| Config file | `~/.ecash/ecash.conf` | `~/Library/Application Support/eCash/ecash.conf` |
+| Data | `~/.ecash/easynet/` | `~/Library/Application Support/eCash/easynet/` |
 
-## Mine
-
-Point any SHA-256 miner at the public pool, with your own `tb1` address as the username. Each block pays its
-finder; there is no sharing. For example, with cpuminer-opt:
-
-```
-cpuminer -a sha256d -o stratum+tcp://seed.ecxfreebank.com:28334 -u tb1q... -p x
-```
-
-## Run the enforcer (for sidechains)
-
-Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is a small fork of LayerTwo-Labs'
-bip300301_enforcer (https://github.com/mbdrivechains/bip300301_enforcer, branch `easynet`): an easynet preset and two
-block-template fixes. Published with Paul Sztorc's OK (DAA group, 2026-10-13).
-
-The node needs a transaction index and ZMQ. In `~/.ecash/ecash.conf`:
+Create the config file (the folder too, if it is not there) with:
 
 ```
 [easynet]
@@ -60,7 +77,41 @@ txindex=1
 zmqpubsequence=tcp://127.0.0.1:28534
 ```
 
-Then:
+`server` lets `bitcoin-cli` and the enforcer talk to the node; `txindex` and `zmqpubsequence` are what the enforcer
+needs (step 4). Then:
+
+```
+bitcoind -daemon
+bitcoin-cli getblockchaininfo        # "chain": "easynet"; "blocks" reaches the explorer's height in a minute or two
+```
+
+The node finds the seed by itself. If it shows no peers (`bitcoin-cli getconnectioncount` is 0), add
+`addnode=163.47.9.132:28533` under `[easynet]` and restart. Stop it with `bitcoin-cli stop`.
+
+## 3. Mine (optional)
+
+You need an address to be paid to. The node has a wallet:
+
+```
+bitcoin-cli createwallet mine
+bitcoin-cli -rpcwallet=mine getnewaddress          # tb1q...
+```
+
+Point any SHA-256 miner at the public pool, with that address as the username. Each block pays its finder; there is
+no sharing. Coins can be spent 100 blocks after the block that paid them. With cpuminer-opt
+(https://github.com/JayDDee/cpuminer-opt):
+
+```
+cpuminer -a sha256d -o stratum+tcp://seed.ecxfreebank.com:28334 -u tb1q... -p x
+```
+
+## 4. Run the enforcer (for sidechains)
+
+Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is a small fork of LayerTwo-Labs'
+bip300301_enforcer (https://github.com/mbdrivechains/bip300301_enforcer, branch `easynet`): an easynet preset and two
+block-template fixes. Published with Paul Sztorc's OK (DAA group, 2026-10-13).
+
+With the node from step 2 running, start it. On Linux:
 
 ```
 bip300301_enforcer --network-preset=easynet \
@@ -70,6 +121,33 @@ bip300301_enforcer --network-preset=easynet \
   --bitcoin-core-skip-version-check
 ```
 
-Sidechain software connects to the enforcer's gRPC at `127.0.0.1:50051`. The sidechain slots live on eCash's betanet
-are proposed on easynet too, with short activation thresholds, so a whole activation, deposit and withdrawal cycle
-takes hours, not months.
+On macOS, the same with the node's cookie in its macOS folder:
+
+```
+bip300301_enforcer --network-preset=easynet \
+  --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$HOME/Library/Application Support/eCash/easynet/.cookie" \
+  --node-zmq-addr-sequence=tcp://127.0.0.1:28534 \
+  --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
+  --bitcoin-core-skip-version-check
+```
+
+Within a few seconds its log says `synced to tip`. It keeps its data in `~/.local/share/bip300301_enforcer` (Linux)
+or `~/Library/Application Support/bip300301_enforcer` (macOS), and serves gRPC on `127.0.0.1:50051`.
+
+## 5. Sidechains
+
+The sidechain slots that are live on eCash's betanet are proposed on easynet too, with short activation thresholds
+(5 of 10 blocks), so a whole activation, deposit and withdrawal cycle takes hours, not months. Run each sidechain's
+own software, pointed at your enforcer's gRPC (`127.0.0.1:50051`) and your node.
+
+## Resets
+
+A reset brings a new genesis, and the last byte of the magic goes up by one. The release tag follows it (`easynet-3`
+is reset 3). After a reset, download the new release and start from empty data: stop the node and the enforcer, move
+the node's `easynet` data folder aside, and in the enforcer's data folder move `validator/testnet4-easynet` and
+`wallet/testnet4-easynet` aside (keep `wallet/testnet4-easynet/seed.json` if you want the same wallet back).
+
+## Build from source
+
+- Node: this branch, with Bitcoin Core's build instructions (`cmake -B build && cmake --build build`).
+- Enforcer: `git clone -b easynet https://github.com/mbdrivechains/bip300301_enforcer && cd bip300301_enforcer && cargo build --release`.
