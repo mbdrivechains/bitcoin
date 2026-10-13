@@ -457,7 +457,8 @@ public:
 /**
  * Easynet: a public, CPU-mineable test network on eCash's rules, run by mbdrivechains. It starts under the
  * 2016-block rule and switches to ASERT (aserti3-2d) at a published height, to rehearse that flag day on a live
- * chain. It keeps the testnet 20-minute rule. Not eCash's own network.
+ * chain. It has the testnet 20-minute rule up to the anchor (block 2016), and none under ASERT. Not eCash's own
+ * network.
  */
 class CEasyNetParams : public CChainParams {
 public:
@@ -478,7 +479,8 @@ public:
         consensus.powLimit = uint256{"000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
-        consensus.fPowAllowMinDifficultyBlocks = true; // the testnet 20-minute rule, also under ASERT (as Bitcoin ABC)
+        consensus.fPowAllowMinDifficultyBlocks = true; // the testnet 20-minute rule, up to block 2016 only (none
+                                                        // under ASERT since easynet-3.1; easynet-3 had it there)
         consensus.enforce_BIP94 = true;                 // timewarp rule from genesis; min-difficulty-safe retargets
         consensus.fPowNoRetargeting = false;
         // No fork from Bitcoin: no fork height, no forced fork difficulty.

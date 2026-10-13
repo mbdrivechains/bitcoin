@@ -581,10 +581,10 @@ BOOST_AUTO_TEST_CASE(ChainParams_EASYNET_sanity)
     BOOST_CHECK(consensus.fPowAllowMinDifficultyBlocks);
 }
 
-// easynet: the 20-minute rule under ASERT. A late block may be mined at powLimit, and a min-difficulty
-// parent leaves the next normal block's target exactly where it would have been (ASERT reads only the
-// anchor and the parent's height and time, never the parent's nBits).
-BOOST_AUTO_TEST_CASE(easynet_twenty_minute_rule_under_asert)
+// easynet: the 20-minute rule ends at the anchor (2026-10-13). Below it a late block must be a min-difficulty
+// block; above it every block gets ASERT's target, however late it is, because ASERT reads only the anchor and
+// the parent's height and time. A late parent makes the next block easier, by ASERT, never down to powLimit.
+BOOST_AUTO_TEST_CASE(easynet_no_twenty_minute_rule_under_asert)
 {
     const auto chainParams = CreateChainParams(*m_node.args, ChainType::EASYNET);
     const auto& params = chainParams->GetConsensus();
@@ -601,27 +601,42 @@ BOOST_AUTO_TEST_CASE(easynet_twenty_minute_rule_under_asert)
         blocks[i].nTime = t0 + i * params.nPowTargetSpacing;
         blocks[i].nBits = normal_bits;
     }
+
+    // Below the anchor (an ordinary height in the first epoch) the rule still applies: one second past
+    // 20 minutes must be a min-difficulty block, exactly 20 minutes is not late.
+    const CBlockIndex* early = &blocks[100];
+    BOOST_REQUIRE(!IsAsertHeight(params, early->nHeight + 1));
+    CBlockHeader early_late, early_edge;
+    early_late.nTime = early->nTime + params.nPowTargetSpacing * 2 + 1;
+    early_edge.nTime = early->nTime + params.nPowTargetSpacing * 2;
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(early, &early_late, params), pow_limit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(early, &early_edge, params), normal_bits);
+
+    // Above the anchor: on time, one second past 20 minutes, and two hours late all get the same ASERT target
+    // (the chain is on schedule, so it is the anchor's), never powLimit.
     const CBlockIndex* tip = &blocks.back();
     BOOST_REQUIRE(IsAsertHeight(params, tip->nHeight + 1));
-
-    CBlockHeader on_time, late;
+    CBlockHeader on_time, late, very_late;
     on_time.nTime = tip->nTime + params.nPowTargetSpacing;
     late.nTime = tip->nTime + params.nPowTargetSpacing * 2 + 1;
-    // On schedule, ASERT keeps the anchor's target; one second past 20 minutes is a min-difficulty block.
+    very_late.nTime = tip->nTime + 2 * 60 * 60;
     BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &on_time, params), normal_bits);
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &late, params), pow_limit_bits);
-    // Exactly 20 minutes is not late.
-    CBlockHeader edge;
-    edge.nTime = tip->nTime + params.nPowTargetSpacing * 2;
-    BOOST_CHECK(GetNextWorkRequired(tip, &edge, params) != pow_limit_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &late, params), normal_bits);
+    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &very_late, params), normal_bits);
 
-    // Path independence: the same tip time and height, once with a normal parent and once with a
-    // min-difficulty parent, give the next block the same target.
-    CBlockHeader next;
-    next.nTime = tip->nTime + params.nPowTargetSpacing;
-    const uint32_t with_normal_parent = GetNextWorkRequired(tip, &next, params);
-    blocks.back().nBits = pow_limit_bits;
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &next, params), with_normal_parent);
+    // The first ASERT block (parent = the anchor) has no 20-minute rule either.
+    const CBlockIndex* anchor_block = &blocks[anchor];
+    BOOST_REQUIRE(IsAsertHeight(params, anchor_block->nHeight + 1));
+    CBlockHeader first_late;
+    first_late.nTime = anchor_block->nTime + 2 * 60 * 60;
+    BOOST_CHECK(GetNextWorkRequired(anchor_block, &first_late, params) != pow_limit_bits);
+
+    // A parent that came two hours late makes the next block easier by ASERT, not down to powLimit.
+    blocks.back().nTime += 2 * 60 * 60;
+    arith_uint256 after_late_parent;
+    after_late_parent.SetCompact(GetNextWorkRequired(tip, &very_late, params));
+    BOOST_CHECK(after_late_parent > normal_target);
+    BOOST_CHECK(after_late_parent < UintToArith256(params.powLimit));
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)

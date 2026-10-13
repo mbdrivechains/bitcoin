@@ -21,12 +21,9 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
     // not retargeting. On a chain with min-difficulty blocks the anchor must be a retarget
     // block (a multiple of the interval, enforce_BIP94 on), so it is never one of them.
     if (!params.fPowNoRetargeting && IsAsertHeight(params, pindexLast->nHeight + 1)) {
-        // easynet: the testnet 20-minute rule also applies under ASERT, as in Bitcoin ABC (aserti32d.cpp). ASERT
-        // reads only the anchor and the parent block, never these blocks' nBits, so they leave its schedule alone.
-        if (params.fPowAllowMinDifficultyBlocks &&
-            pblock->GetBlockTime() > pindexLast->GetBlockTime() + params.nPowTargetSpacing * 2) {
-            return UintToArith256(params.powLimit).GetCompact();
-        }
+        // easynet: no 20-minute rule under ASERT (from 2026-10-13; easynet-3 had it here). fPowAllowMinDifficultyBlocks
+        // governs only the 2016-block rule below, up to the anchor. Above it every target is ASERT's, set by the
+        // anchor and the parent alone, never by this block's own time, so a hash cut is a real stall.
         const CBlockIndex* pindexAnchor = pindexLast->GetAncestor(params.EcashAsertAnchorHeight);
         assert(pindexAnchor != nullptr);
         return GetNextASERTWorkRequired(pindexLast, pindexAnchor, params);
