@@ -9,10 +9,12 @@
 # node you already run is not touched), the enforcer's data and logs. Nothing runs as root and nothing starts at
 # boot. Options: EASYNET_TAG=easynet-N installs that release instead of the newest; EASYNET_NO_ENFORCER=1 runs the
 # node only.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "easynet: stopped by an error at line %s (see the messages above)\n" "$LINENO" >&2' ERR
 
 REPO=mbdrivechains/bitcoin
-SCRIPT_URL=https://raw.githubusercontent.com/$REPO/easynet/contrib/easynet/easynet.sh
+RAW=https://raw.githubusercontent.com/$REPO/easynet/contrib/easynet
+SCRIPT_URL=$RAW/easynet.sh
 H=${EASYNET_HOME:-$HOME/easynet}
 P2P=28533 RPC=28532 ZMQ=28535 GRPC=50051 ERPC=8122
 
@@ -61,8 +63,12 @@ installed_tag() { [ -L "$H/current" ] && basename "$(readlink "$H/current")" || 
 
 latest_tag() {
     if [ -n "${EASYNET_TAG:-}" ]; then echo "$EASYNET_TAG"; return; fi
-    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" 2>/dev/null |
-        grep -o '"tag_name": *"easynet-[^"]*"' | head -1 | sed 's/.*"\(easynet-[^"]*\)"$/\1/'
+    local t
+    t=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" 2>/dev/null |
+        grep -o '"tag_name": *"easynet-[^"]*"' | head -1 | sed 's/.*"\(easynet-[^"]*\)"$/\1/') || t=""
+    # GitHub's API allows 60 anonymous calls an hour per address; past that, the branch's pointer file.
+    [ -n "$t" ] || t=$(curl -fsSL "$RAW/LATEST" 2>/dev/null | head -1) || t=""
+    echo "$t"
 }
 
 # Download a release's node + enforcer for this platform, check them against the release's SHA256SUMS, unpack them
