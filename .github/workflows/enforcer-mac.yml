@@ -107,7 +107,7 @@ jobs:
           trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
           DD="$HOME/Library/Application Support/eCash"
           mkdir -p "$DD"
-          printf '[easynet]\nserver=1\ntxindex=1\nzmqpubsequence=tcp://127.0.0.1:28534\n' > "$DD/ecash.conf"
+          printf '[easynet]\nserver=1\ntxindex=1\nzmqpubsequence=tcp://127.0.0.1:28535\n' > "$DD/ecash.conf"
           "$B/bitcoind" -daemon
           for i in $(seq 1 30); do "$B/bitcoin-cli" getblockchaininfo >/dev/null 2>&1 && break; sleep 1; done
           for i in $(seq 1 90); do
@@ -119,7 +119,7 @@ jobs:
           echo "$I" | head -4
           "$NAME/bip300301_enforcer" --network-preset=easynet \
             --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$DD/easynet/.cookie" \
-            --node-zmq-addr-sequence=tcp://127.0.0.1:28534 \
+            --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
             --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
             --bitcoin-core-skip-version-check > enforcer.log 2>&1 &
           P=$!

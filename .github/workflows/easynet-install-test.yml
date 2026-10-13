@@ -1,0 +1,50 @@
+name: easynet-install-test
+
+# Runs the one-command installer exactly as EASYNET.md gives it (curl ... | bash, from the easynet branch) on macOS
+# (Apple Silicon and Intel) and Ubuntu, then status, address, stop/start and remove. Live: it joins the real easynet.
+#   gh workflow run easynet-install-test.yml -R mbdrivechains/bitcoin
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release to install (empty = the newest easynet-N)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15-intel, ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      EASYNET_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Install (curl | bash)
+        run: curl -fsSL https://raw.githubusercontent.com/mbdrivechains/bitcoin/easynet/contrib/easynet/easynet.sh | bash
+
+      - name: Status, address
+        run: |
+          ~/easynet/easynet status
+          ~/easynet/easynet status | grep -q "node:     running"
+          ~/easynet/easynet status | grep -q "enforcer: running"
+          ~/easynet/easynet cli getblockchaininfo | grep '"chain": "easynet"'
+          ~/easynet/easynet address
+
+      - name: Stop, start
+        run: |
+          ~/easynet/easynet stop
+          ~/easynet/easynet start
+          ~/easynet/easynet status | grep -q "enforcer: running"
+
+      - name: Remove
+        run: |
+          ~/easynet/easynet remove --yes
+          [ ! -e ~/easynet ]
+          ! pgrep -l "bitcoind|bip300301_enforcer"
