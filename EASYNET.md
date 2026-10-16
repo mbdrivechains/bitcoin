@@ -162,9 +162,61 @@ or `~/Library/Application Support/bip300301_enforcer` (macOS), and serves gRPC o
 
 ## 5. Sidechains
 
-The sidechain slots that are live on eCash's betanet are proposed on easynet too, with short activation thresholds
+The sidechains that are live or proposed on eCash's betanet are proposed on easynet too, with short activation thresholds
 (5 of 10 blocks), so a whole activation, deposit and withdrawal cycle takes hours, not months. Run each sidechain's
 own software, pointed at your enforcer's gRPC (`127.0.0.1:50051`) and your node.
+
+## 6. Propose your own sidechain (M1)
+
+A sidechain starts as a proposal (M1) in a block's coinbase. A block carries your proposal only if it was built from
+your own enforcer's template, and the public pool builds from ours, so you mine a block yourself, on your CPU. After
+that our enforcer acks every proposal for an empty slot, and yours activates once it has more than 5 acks within 10
+blocks. Or post the slot number, title and description in the Telegram group, and we will propose it for you.
+
+1. **Pick an empty slot** (0 to 255). The explorer lists the ones in use: https://easy.ecxfreebank.com/sidechains
+2. **Restart the enforcer with block templates on,** paying the block to your address (step 3 shows how to get one).
+   That is the command from step 4 with three more options:
+   `--enable-mempool --enable-block-template-server --coinbase-recipient=tb1q...`.
+   With the one-command install:
+
+   ```
+   ~/easynet/easynet stop
+   EASYNET_NO_ENFORCER=1 ~/easynet/easynet start
+   ~/easynet/current/bin/bip300301_enforcer --data-dir=$HOME/easynet/enforcer --network-preset=easynet \
+     --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path=$HOME/easynet/node/easynet/.cookie \
+     --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
+     --enable-wallet --wallet-auto-create --wallet-sync-source=disabled --bitcoin-core-skip-version-check \
+     --enable-mempool --enable-block-template-server --coinbase-recipient=tb1q...
+   ```
+
+   It serves `getblocktemplate` on `127.0.0.1:8122`.
+3. **Submit the proposal** with grpcurl (https://github.com/fullstorydev/grpcurl). The two hash ids identify your
+   sidechain's release (BIP 300); zeros are fine for a test.
+
+   ```
+   grpcurl -plaintext -d '{"sidechain_id": 200, "declaration": {"v0": {
+     "title": "my-sidechain", "description": "what it does",
+     "hash_id_1": {"hex": "0000000000000000000000000000000000000000000000000000000000000000"},
+     "hash_id_2": {"hex": "0000000000000000000000000000000000000000"}}}}' \
+     127.0.0.1:50051 cusf.mainchain.v1.BlockProducerService/SubmitSidechainProposal
+   ```
+
+   `.../GetBlockProducerState` (same address, no `-d`) lists it under `pendingProposals`.
+4. **Mine.** cpuminer-opt and the enforcer don't quite fit (JSON-RPC 1.0 against 2.0, and the coinbase's segwit
+   form), so run `gbt_shim.py` between them (this repo, `contrib/easynet/`; plain Python 3, nothing to install):
+
+   ```
+   curl -fsSLO https://raw.githubusercontent.com/mbdrivechains/bitcoin/easynet/contrib/easynet/gbt_shim.py
+   python3 gbt_shim.py 8123 http://127.0.0.1:8122/ &
+   cpuminer -a sha256d -o http://127.0.0.1:8123 -u x -p x -t 1
+   ```
+
+   At today's difficulty, one thread of a desktop CPU finds a block in about 15 minutes on average; more threads,
+   sooner. Your block shows on
+   the explorer with your proposal in its coinbase. You can stop mining then.
+5. **Watch it activate,** usually within about 10 blocks:
+   `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechainProposals`, then
+   `.../GetSidechains`.
 
 ## Resets and updates
 
