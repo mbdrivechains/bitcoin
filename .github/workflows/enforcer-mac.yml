@@ -24,7 +24,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -67,7 +67,7 @@ jobs:
 
   universal:
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: write        # upload to the release
@@ -91,6 +91,15 @@ jobs:
           cp enforcer-aarch64-apple-darwin/README.md enforcer-aarch64-apple-darwin/SOURCE "$NAME/"
           cat "$NAME/SOURCE"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: macOS 14 gate (both CPUs built for macOS 14.0)
+        # The runners are macOS 15; MACOSX_DEPLOYMENT_TARGET pins the minimum, and this checks it held.
+        run: |
+          for a in arm64 x86_64; do
+            M=$(otool -arch $a -l "$NAME/bip300301_enforcer" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos"{print $2; exit}')
+            echo "$a: minos $M"
+            [ "$M" = "14.0" ] || { echo "NOT macOS 14: $a"; exit 1; }
+          done
 
       - name: Portability gate (only /usr/lib and /System/Library)
         run: |
