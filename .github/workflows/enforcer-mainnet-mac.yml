@@ -1,0 +1,169 @@
+name: enforcer-mainnet-mac
+
+# Builds a universal (Apple Silicon + Intel) macOS tarball of our eCash mainnet enforcer fork
+# (github.com/mbdrivechains/bip300301_enforcer, branch mainnet) at a tag, attested, and leaves it as this run's artifact.
+# The release lives on mbdrivechains/bip300301_enforcer, which this repository's token can't write to, so the tarball
+# is downloaded from the run (gh run download) and attached there by hand.
+#   gh workflow run enforcer-mainnet-mac.yml -R mbdrivechains/bitcoin -f tag=ecash-mainnet-1
+# Same build as enforcer-mac.yml. The test runs the universal enforcer with the mainnet build's easynet flags
+# (--fork=ecash --network-magic=ea5e4e03) against an easynet macOS node from this repository's releases, on the live
+# easynet, with Homebrew hidden.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag on mbdrivechains/bip300301_enforcer (e.g. ecash-mainnet-1)"
+        required: true
+      node_release:
+        description: "easynet release here whose macOS node the test runs against"
+        required: true
+        default: "easynet-3.1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mbdrivechains/bip300301_enforcer
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} -p bip300301_enforcer --bin bip300301_enforcer
+
+      - name: Smoke test
+        run: |
+          E=target/${{ matrix.target }}/release/bip300301_enforcer
+          "$E" --version
+          "$E" --help | grep -A4 -- '--fork <FORK>' | grep 'possible values: bitcoin, ecash-alphanet, ecash-betanet, ecash'
+
+      - name: Stage
+        run: |
+          mkdir out
+          cp target/${{ matrix.target }}/release/bip300301_enforcer README.md out/
+          git log -1 --format="source: github.com/mbdrivechains/bip300301_enforcer @ %H (%cs)" > out/SOURCE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enforcer-${{ matrix.target }}
+          path: out
+
+  universal:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write        # build provenance (attestation)
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      NODE_RELEASE: ${{ inputs.node_release }}
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Join the two CPUs (lipo) and ad-hoc sign
+        run: |
+          NAME="bip300301_enforcer-${TAG}-universal-apple-darwin"
+          mkdir "$NAME"
+          lipo -create enforcer-aarch64-apple-darwin/bip300301_enforcer enforcer-x86_64-apple-darwin/bip300301_enforcer \
+            -output "$NAME/bip300301_enforcer"
+          chmod 755 "$NAME/bip300301_enforcer"
+          codesign -s - -f "$NAME/bip300301_enforcer"
+          lipo -archs "$NAME/bip300301_enforcer"
+          cp enforcer-aarch64-apple-darwin/README.md enforcer-aarch64-apple-darwin/SOURCE "$NAME/"
+          cat "$NAME/SOURCE"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: macOS 14 gate (both CPUs built for macOS 14.0)
+        run: |
+          for a in arm64 x86_64; do
+            M=$(otool -arch $a -l "$NAME/bip300301_enforcer" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos"{print $2; exit}')
+            echo "$a: minos $M"
+            [ "$M" = "14.0" ] || { echo "NOT macOS 14: $a"; exit 1; }
+          done
+
+      - name: Portability gate (only /usr/lib and /System/Library)
+        run: |
+          otool -L "$NAME/bip300301_enforcer"
+          BAD=$(otool -L "$NAME/bip300301_enforcer" | grep -E '^\s' | grep -vE '^\s+(/usr/lib/|/System/Library/)' || true)
+          [ -z "$BAD" ] || { echo "NON-PORTABLE:"; echo "$BAD"; exit 1; }
+
+      - name: Run against the live easynet with --fork=ecash (Homebrew hidden)
+        run: |
+          gh release download "$NODE_RELEASE" -R "$GITHUB_REPOSITORY" -p "bitcoin-${NODE_RELEASE}-universal-apple-darwin.tar.gz"
+          tar -xzf "bitcoin-${NODE_RELEASE}-universal-apple-darwin.tar.gz"
+          B=$PWD/bitcoin-${NODE_RELEASE}/bin
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          DD="$HOME/Library/Application Support/eCash"
+          mkdir -p "$DD"
+          printf '[easynet]\nserver=1\ntxindex=1\nzmqpubsequence=tcp://127.0.0.1:28535\n' > "$DD/ecash.conf"
+          "$B/bitcoind" -daemon
+          for i in $(seq 1 30); do "$B/bitcoin-cli" getblockchaininfo >/dev/null 2>&1 && break; sleep 1; done
+          for i in $(seq 1 90); do
+            I=$("$B/bitcoin-cli" getblockchaininfo)
+            b=$(echo "$I" | python3 -c 'import json,sys; print(json.load(sys.stdin)["blocks"])')
+            h=$(echo "$I" | python3 -c 'import json,sys; print(json.load(sys.stdin)["headers"])')
+            [ "$b" -gt 0 ] && [ "$b" = "$h" ] && break; sleep 2
+          done
+          echo "$I" | head -4
+          "$NAME/bip300301_enforcer" --fork=ecash --network-magic=ea5e4e03 \
+            --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$DD/easynet/.cookie" \
+            --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
+            --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
+            --bitcoin-core-skip-version-check > enforcer.log 2>&1 &
+          P=$!
+          ok=0
+          for i in $(seq 1 60); do
+            grep -q "synced to tip" enforcer.log && { ok=1; break; }
+            kill -0 $P 2>/dev/null || break
+            sleep 2
+          done
+          grep -E "Synced [0-9]+ blocks|synced to tip|ERROR" enforcer.log | head -5 || true
+          kill $P 2>/dev/null || true
+          "$B/bitcoin-cli" stop
+          sleep 3
+          [ $ok = 1 ] || { echo "enforcer did not sync to the tip"; tail -30 enforcer.log; exit 1; }
+          echo "enforcer synced easynet to block $b"
+
+      - name: Package
+        run: |
+          F="${NAME}.tar.gz"
+          tar -czf "$F" "$NAME"
+          shasum -a 256 "$F" | tee "$F.sha256"
+          echo "F=$F" >> "$GITHUB_ENV"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.F }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.F }}
+            ${{ env.F }}.sha256
