@@ -17,8 +17,9 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
 {
     assert(pindexLast != nullptr);
 
-    // ASERT takes over for every block above the anchor. Chains that never retarget keep
-    // not retargeting. On a chain with min-difficulty blocks the anchor must be a retarget
+    // ASERT takes over for every block above the anchor, up to its end height if it has one
+    // (easynet: the 288-block rule from there). Chains that never retarget keep not
+    // retargeting. On a chain with min-difficulty blocks the anchor must be a retarget
     // block (a multiple of the interval, enforce_BIP94 on), so it is never one of them.
     if (!params.fPowNoRetargeting && IsAsertHeight(params, pindexLast->nHeight + 1)) {
         // easynet: no 20-minute rule under ASERT (from 2026-10-13; easynet-3 had it here). fPowAllowMinDifficultyBlocks
@@ -35,7 +36,10 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
     // Only change once per difficulty adjustment interval
     if ((pindexLast->nHeight+1) % interval != 0)
     {
-        if (params.fPowAllowMinDifficultyBlocks)
+        // easynet: the 20-minute rule ends at the ASERT anchor for good, so it stays off after ASERT
+        // hands over to the 288-block rule too.
+        const bool past_asert_anchor{params.EcashAsertAnchorHeight > 0 && pindexLast->nHeight + 1 > params.EcashAsertAnchorHeight};
+        if (params.fPowAllowMinDifficultyBlocks && !past_asert_anchor)
         {
             // Special difficulty rule for testnet:
             // If the new block's timestamp is more than 2* 10 minutes
@@ -119,7 +123,8 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
 
 bool IsAsertHeight(const Consensus::Params& params, int64_t height)
 {
-    return params.EcashAsertAnchorHeight > 0 && height > params.EcashAsertAnchorHeight;
+    return params.EcashAsertAnchorHeight > 0 && height > params.EcashAsertAnchorHeight &&
+           (params.EcashAsertEndHeight == 0 || height < params.EcashAsertEndHeight);
 }
 
 unsigned int GetNextASERTWorkRequired(const CBlockIndex* pindexPrev, const CBlockIndex* pindexAnchorBlock, const Consensus::Params& params)

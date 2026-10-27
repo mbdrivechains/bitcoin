@@ -480,15 +480,20 @@ public:
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true; // the testnet 20-minute rule, up to block 2016 only (none
-                                                        // under ASERT since easynet-3.1; easynet-3 had it there)
+                                                        // under ASERT since easynet-3.1, none after it either)
         consensus.enforce_BIP94 = true;                 // timewarp rule from genesis; min-difficulty-safe retargets
         consensus.fPowNoRetargeting = false;
-        // No fork from Bitcoin: no fork height, no forced fork difficulty.
-        consensus.EcashHeight = 0;
-        consensus.EcashForkBits = 0;
+        // eCash mainnet's DAA from block 4032 (easynet-3.2; Michael 2026-10-27: "lets apply same daa there too",
+        // "switch the running chain", then "why cant you do this today?"): a retarget every 288 blocks,
+        // (6 * old + measured) / 7, as from eCash's fork height. Block 4032 (14 * 288, the first 288-block boundary
+        // ahead) carries a fixed difficulty, as mainnet's fork block does: 1.4255, the ASERT difficulty at one CPU
+        // thread when this was set (block 3739).
+        consensus.EcashHeight = 4032;
+        consensus.EcashForkBits = 0x1d00b395;
         // The flag day (Michael 2026-10-12: "at end of first epoch"): the anchor is block 2016, the first retarget
-        // block, so it can never be a 20-minute (min-difficulty) block; ASERT sets every block from 2017 on.
+        // block, so it can never be a 20-minute (min-difficulty) block; ASERT sets every block from 2017 to 4031.
         consensus.EcashAsertAnchorHeight = 2016;
+        consensus.EcashAsertEndHeight = 4032;
         consensus.EcashAsertHalfLife = 2 * 24 * 60 * 60; // two days, as proposed for eCash
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
