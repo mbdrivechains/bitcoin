@@ -56,9 +56,9 @@ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Par
  * given height is not possible, given the proof-of-work on the prior block as
  * specified by old_nbits.
  *
- * This function only checks that the new value is within a factor of 4 of the
- * old value for blocks at the difficulty adjustment interval, and otherwise
- * requires the values to be the same.
+ * This function only checks that the new value is within the allowed retarget
+ * bounds at a difficulty adjustment interval, and otherwise requires the
+ * values to be the same.
  *
  * At ASERT heights the target moves every block and a valid chain bounds
  * that move only through median-time-past, so no fixed per-block limit is
