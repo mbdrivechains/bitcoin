@@ -594,21 +594,21 @@ BOOST_AUTO_TEST_CASE(ChainParams_EASYNET_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::EASYNET);
     const auto consensus = CreateChainParams(*m_node.args, ChainType::EASYNET)->GetConsensus();
-    BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight, 2016);
-    BOOST_CHECK_EQUAL(consensus.EcashAsertHalfLife, ASERT_SPEC_HALF_LIFE);
-    BOOST_CHECK(consensus.fPowAllowMinDifficultyBlocks);
-    // easynet-3.2: eCash mainnet's 288-block rule from 4032, with the fork block at difficulty 1.4255
-    BOOST_CHECK_EQUAL(consensus.EcashHeight, 4032);
-    BOOST_CHECK_EQUAL(consensus.EcashAsertEndHeight, 4032);
+    // easynet-4: eCash mainnet's 288-block rule from block 288, with the fork block at difficulty 1.4255; no ASERT,
+    // no 20-minute rule
+    BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.EcashAsertEndHeight, 0);
+    BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+    BOOST_CHECK_EQUAL(consensus.EcashHeight, 288);
     BOOST_CHECK_EQUAL(consensus.EcashForkBits, 0x1d00b395U);
 }
 
-// easynet-3.2: ASERT hands over to eCash mainnet's 288-block rule at EcashHeight. Before it, ASERT; at it, the
-// forced fork difficulty, whatever the last window looked like; then that difficulty, with no 20-minute rule, up to
-// the first retarget, which measures from the fork block; each retarget after that starts at the previous window's
-// last block. Each step is (6 * old + measured) / 7, measured clamped to a quarter and four times the 288 * 600 s
+// easynet-4: eCash mainnet's 288-block rule from EcashHeight. Before it, the genesis difficulty, with no 20-minute
+// rule; at it, the forced fork difficulty, whatever the chain before looked like; then that difficulty, with no
+// 20-minute rule, up to the first retarget, which measures from the fork block; each retarget after that starts at
+// the previous window's last block. Each step is (6 * old + measured) / 7, measured clamped to a quarter and four times the 288 * 600 s
 // target, so difficulty moves at most +12% or -30% a window.
-BOOST_AUTO_TEST_CASE(easynet_288_block_rule_after_asert)
+BOOST_AUTO_TEST_CASE(easynet_288_block_rule)
 {
     const auto chainParams = CreateChainParams(*m_node.args, ChainType::EASYNET);
     const auto& params = chainParams->GetConsensus();
@@ -617,13 +617,12 @@ BOOST_AUTO_TEST_CASE(easynet_288_block_rule_after_asert)
     const int64_t window = 288 * spacing;
     const arith_uint256 pow_limit{UintToArith256(params.powLimit)};
     const uint32_t pow_limit_bits = pow_limit.GetCompact();
-    const arith_uint256 normal_target{pow_limit >> 10};
-    const uint32_t normal_bits = normal_target.GetCompact();
+    const uint32_t normal_bits = chainParams->GenesisBlock().nBits;
     const int64_t t0 = chainParams->GenesisBlock().nTime;
     BOOST_REQUIRE_EQUAL(params.DifficultyAdjustmentInterval(fork - 1), 2016);
     BOOST_REQUIRE_EQUAL(params.DifficultyAdjustmentInterval(fork), 288);
 
-    // An on-schedule chain: ASERT keeps the anchor's bits up to the fork, which then carries the fork bits.
+    // An on-schedule chain: the genesis bits up to the fork, which then carries the fork bits.
     std::vector<CBlockIndex> blocks(fork + 3 * 288 + 1);
     for (int i = 0; i < (int)blocks.size(); i++) {
         blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
@@ -645,11 +644,16 @@ BOOST_AUTO_TEST_CASE(easynet_288_block_rule_after_asert)
         return std::min(target, pow_limit).GetCompact();
     };
 
-    BOOST_CHECK(IsAsertHeight(params, fork - 1));
+    // Before the fork the genesis bits hold, however late the block: no ASERT, no 20-minute rule.
+    for (const int height : {1, 2, fork - 1}) {
+        BOOST_CHECK(!IsAsertHeight(params, height));
+        BOOST_CHECK_EQUAL(next(height, spacing), normal_bits);
+        BOOST_CHECK_EQUAL(next(height, 2 * spacing + 1), normal_bits);
+        BOOST_CHECK_EQUAL(next(height, 2 * 60 * 60), normal_bits);
+    }
     BOOST_CHECK(!IsAsertHeight(params, fork));
-    BOOST_CHECK_EQUAL(next(fork - 1, spacing), normal_bits);
 
-    // The fork block: the fork bits, on time or hours late, and whatever the last ASERT window took.
+    // The fork block: the fork bits, on time or hours late, and whatever the blocks before it took.
     BOOST_CHECK_EQUAL(next(fork, spacing), params.EcashForkBits);
     BOOST_CHECK_EQUAL(next(fork, 3 * 60 * 60), params.EcashForkBits);
     blocks[fork - 288].nTime -= 10 * window;
@@ -690,64 +694,6 @@ BOOST_AUTO_TEST_CASE(easynet_288_block_rule_after_asert)
     // Twice as slow: the target rises by 8/7.
     for (int i = r1 - 1; i < r2; i++) blocks[i].nTime = blocks[r1 - 1].nTime + (i - (r1 - 1)) * 2 * spacing;
     BOOST_CHECK_EQUAL(next(r2, spacing), damped(params.EcashForkBits, 2 * window));
-}
-
-// easynet: the 20-minute rule ends at the anchor (2026-10-13). Below it a late block must be a min-difficulty
-// block; above it every block gets ASERT's target, however late it is, because ASERT reads only the anchor and
-// the parent's height and time. A late parent makes the next block easier, by ASERT, never down to powLimit.
-BOOST_AUTO_TEST_CASE(easynet_no_twenty_minute_rule_under_asert)
-{
-    const auto chainParams = CreateChainParams(*m_node.args, ChainType::EASYNET);
-    const auto& params = chainParams->GetConsensus();
-    const int anchor = params.EcashAsertAnchorHeight;
-    const uint32_t pow_limit_bits = UintToArith256(params.powLimit).GetCompact();
-    const arith_uint256 normal_target{UintToArith256(params.powLimit) >> 10};
-    const uint32_t normal_bits = normal_target.GetCompact();
-    const int64_t t0 = chainParams->GenesisBlock().nTime;
-
-    std::vector<CBlockIndex> blocks(anchor + 10);
-    for (int i = 0; i < (int)blocks.size(); i++) {
-        blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
-        blocks[i].nHeight = i;
-        blocks[i].nTime = t0 + i * params.nPowTargetSpacing;
-        blocks[i].nBits = normal_bits;
-    }
-
-    // Below the anchor (an ordinary height in the first epoch) the rule still applies: one second past
-    // 20 minutes must be a min-difficulty block, exactly 20 minutes is not late.
-    const CBlockIndex* early = &blocks[100];
-    BOOST_REQUIRE(!IsAsertHeight(params, early->nHeight + 1));
-    CBlockHeader early_late, early_edge;
-    early_late.nTime = early->nTime + params.nPowTargetSpacing * 2 + 1;
-    early_edge.nTime = early->nTime + params.nPowTargetSpacing * 2;
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(early, &early_late, params), pow_limit_bits);
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(early, &early_edge, params), normal_bits);
-
-    // Above the anchor: on time, one second past 20 minutes, and two hours late all get the same ASERT target
-    // (the chain is on schedule, so it is the anchor's), never powLimit.
-    const CBlockIndex* tip = &blocks.back();
-    BOOST_REQUIRE(IsAsertHeight(params, tip->nHeight + 1));
-    CBlockHeader on_time, late, very_late;
-    on_time.nTime = tip->nTime + params.nPowTargetSpacing;
-    late.nTime = tip->nTime + params.nPowTargetSpacing * 2 + 1;
-    very_late.nTime = tip->nTime + 2 * 60 * 60;
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &on_time, params), normal_bits);
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &late, params), normal_bits);
-    BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &very_late, params), normal_bits);
-
-    // The first ASERT block (parent = the anchor) has no 20-minute rule either.
-    const CBlockIndex* anchor_block = &blocks[anchor];
-    BOOST_REQUIRE(IsAsertHeight(params, anchor_block->nHeight + 1));
-    CBlockHeader first_late;
-    first_late.nTime = anchor_block->nTime + 2 * 60 * 60;
-    BOOST_CHECK(GetNextWorkRequired(anchor_block, &first_late, params) != pow_limit_bits);
-
-    // A parent that came two hours late makes the next block easier by ASERT, not down to powLimit.
-    blocks.back().nTime += 2 * 60 * 60;
-    arith_uint256 after_late_parent;
-    after_late_parent.SetCompact(GetNextWorkRequired(tip, &very_late, params));
-    BOOST_CHECK(after_late_parent > normal_target);
-    BOOST_CHECK(after_late_parent < UintToArith256(params.powLimit));
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)

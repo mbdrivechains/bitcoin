@@ -479,21 +479,19 @@ public:
         consensus.powLimit = uint256{"000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
-        consensus.fPowAllowMinDifficultyBlocks = true; // the testnet 20-minute rule, up to block 2016 only (none
-                                                        // under ASERT since easynet-3.1, none after it either)
-        consensus.enforce_BIP94 = true;                 // timewarp rule from genesis; min-difficulty-safe retargets
+        consensus.fPowAllowMinDifficultyBlocks = false; // no 20-minute rule (easynet-4)
+        consensus.enforce_BIP94 = true;                  // timewarp rule from genesis
         consensus.fPowNoRetargeting = false;
-        // eCash mainnet's DAA from block 4032 (easynet-3.2; Michael 2026-10-27: "lets apply same daa there too",
-        // "switch the running chain", then "why cant you do this today?"): a retarget every 288 blocks,
-        // (6 * old + measured) / 7, as from eCash's fork height. Block 4032 (14 * 288, the first 288-block boundary
-        // ahead) carries a fixed difficulty, as mainnet's fork block does: 1.4255, the ASERT difficulty at one CPU
-        // thread when this was set (block 3739).
-        consensus.EcashHeight = 4032;
+        // easynet-4 (Michael 2026-10-29: "Fast start, then eCash"): eCash mainnet's DAA, with the fork at block 288.
+        // Blocks 1 to 287 keep the genesis difficulty (0.28, about 2-minute blocks on one CPU thread), so coins
+        // mature and the sidechains activate within hours. Block 288 carries a fixed difficulty, as mainnet's fork
+        // block does: 1.4255, about 10-minute blocks on one thread. From there a retarget every 288 blocks,
+        // (6 * old + measured) / 7.
+        consensus.EcashHeight = 288;
         consensus.EcashForkBits = 0x1d00b395;
-        // The flag day (Michael 2026-10-12: "at end of first epoch"): the anchor is block 2016, the first retarget
-        // block, so it can never be a 20-minute (min-difficulty) block; ASERT sets every block from 2017 to 4031.
-        consensus.EcashAsertAnchorHeight = 2016;
-        consensus.EcashAsertEndHeight = 4032;
+        // No ASERT on easynet-4 (it ran from block 2017 to 4031 on easynet-3).
+        consensus.EcashAsertAnchorHeight = 0;
+        consensus.EcashAsertEndHeight = 0;
         consensus.EcashAsertHalfLife = 2 * 24 * 60 * 60; // two days, as proposed for eCash
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
@@ -517,27 +515,26 @@ public:
         pchMessageStart[0] = 0xea;
         pchMessageStart[1] = 0x5e;
         pchMessageStart[2] = 0x4e;
-        pchMessageStart[3] = 0x03; // reset 2026-10-13: genesis at difficulty 0.28 (about 2-minute blocks at 10 MH/s)
+        pchMessageStart[3] = 0x04; // reset 2026-10-29: L2L's new enforcer (one M1 a block) rejects easynet-3
         nDefaultPort = 28533;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 1;
         m_assumed_chain_state_size = 1;
 
-        // Bitcoin block 971,144: this easynet (the third, magic ...03) was started after it. Its genesis is at
-        // difficulty 0.28 (bits 0x1d03943d), about 2-minute blocks at 10 MH/s (Michael 2026-10-13), so the first
-        // 2016 blocks run fast and the switch to ASERT at block 2016 comes about 2.8 days after the start.
-        const char* easynet_genesis_msg = "13/Oct/2026 easynet3 00000000000000000001ef6128bde202062f4f3c0ad73c6993e0a7f4941bc924";
+        // Bitcoin block 973,648: this easynet (the fourth, magic ...04) was started after it. Its genesis is at
+        // difficulty 0.28 (bits 0x1d03943d), about 2-minute blocks on one CPU thread, up to the fork block 288.
+        const char* easynet_genesis_msg = "29/Oct/2026 easynet4 00000000000000000001df2937bcfc0540b8bc9eed3aa4c45fc9f3c1afdde316";
         const CScript easynet_genesis_script = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
         genesis = CreateGenesisBlock(easynet_genesis_msg,
                 easynet_genesis_script,
-                1791842504,
-                1046346704,
+                1793250719,
+                792134520,
                 0x1d03943d,
                 1,
                 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000001a4105dc30c636e71ac2d844caa32d6fa2e9aacc5b2225ea772dd9490"});
-        assert(genesis.hashMerkleRoot == uint256{"31d7969b1c60f72a9390ce11c927e475ff03a1be8b382e20a2b6dcaed16b9a9b"});
+        assert(consensus.hashGenesisBlock == uint256{"000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211"});
+        assert(genesis.hashMerkleRoot == uint256{"ae8d64f4182a5bae3e9dd8d74dde8748904bee187a194c73c8054ea74883a277"});
 
         vFixedSeeds.clear();
         vSeeds.clear(); // no DNS seed: the fixed seed below, or -addnode
