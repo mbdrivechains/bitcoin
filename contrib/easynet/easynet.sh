@@ -148,7 +148,7 @@ start_enforcer() {
     done
     mkdir -p "$H/enforcer/logs"
     local mark; mark=$(cat "$H"/enforcer/logs/* 2>/dev/null | wc -c)
-    nohup "$H/current/bin/bip300301_enforcer" --data-dir="$H/enforcer" --network-preset=easynet \
+    nohup "$H/current/bin/bip300301_enforcer" --data-dir="$H/enforcer" --fork=ecash --log-directory="$H/enforcer/logs" \
         --node-rpc-addr=127.0.0.1:$RPC --node-rpc-cookie-path="$H/node/easynet/.cookie" \
         --node-zmq-addr-sequence=tcp://127.0.0.1:$ZMQ \
         --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \

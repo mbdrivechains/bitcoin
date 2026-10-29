@@ -1,7 +1,7 @@
 # easynet
 
-easynet is a public, CPU-mined test network on eCash's rules: eCash mainnet's difficulty rule from block 4032 (the
-ASERT proposal, #2, before it), the timewarp fix (#4), and BIP 300/301 (drivechains) enforced from genesis. Its coins
+easynet is a public, CPU-mined test network on eCash's rules: eCash mainnet's difficulty rule (from block 288), the
+timewarp fix (#4), and BIP 300/301 (drivechains) enforced from genesis by LayerTwo-Labs' current enforcer. Its coins
 have no value. It is run by mbdrivechains for experiments, and **it can be restarted at any time**.
 
 - Explorer: https://easy.ecxfreebank.com
@@ -29,29 +29,25 @@ touched). Nothing runs as root and nothing starts at boot. Afterwards:
 To read the script before running it: `curl -fsSLO <the URL above>`, read `easynet.sh`, then `bash easynet.sh`.
 Steps 1 to 4 below do the same by hand.
 
-## The network now (reset 3, 2026-10-13, release `easynet-3.2`)
+## The network now (reset 4, 2026-10-29, release `easynet-4`)
 
 | | |
 |---|---|
-| Genesis | `00000001a4105dc30c636e71ac2d844caa32d6fa2e9aacc5b2225ea772dd9490` |
-| Network magic | `ea5e4e03` |
+| Genesis | `000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211` |
+| Network magic | `ea5e4e04` |
 | Ports | P2P 28533, RPC 28532 |
 | Seed | `163.47.9.132:28533` (built in) |
 | Addresses | testnet style (`tb1...`) |
 
-Blocks come about every two minutes at the start (genesis difficulty 0.28 against about 10 MH/s of CPU mining). At
-block 2016 the difficulty retargets, and from block 2017 ASERT (half-life two days) steers it toward 10-minute blocks.
+Blocks come about every two minutes at the start (genesis difficulty 0.28 against one CPU thread, about 10 MH/s), so
+coins mature and sidechains activate within hours. Block 288 has a fixed difficulty (1.4255), about 10-minute blocks,
+as eCash mainnet's fork block does. After it, eCash mainnet's difficulty rule: the difficulty changes only once every
+288 blocks (about two days), each step moving it 1/7 of the way toward the measured block rate, at most 12% up or 30%
+down. There is no 20-minute rule, so if mining stops, the chain stops until it resumes.
 
-Up to block 2016 the testnet 20-minute rule applies: a block more than 20 minutes after its parent may be mined at
-minimum difficulty. Under ASERT there is no such rule (from release `easynet-3.1`): every block from 2017 on is at
-ASERT's difficulty, so if mining stops, the chain stops until it resumes. **Run `easynet-3.1` or later before block
-2017**; an `easynet-3` node splits off at the first gap of over 20 minutes after that.
-
-From block 4032 (release `easynet-3.2`), easynet runs eCash mainnet's difficulty rule instead of ASERT. Block 4032
-has a fixed difficulty (1.4255). After it, the difficulty changes only once every 288 blocks (about two days): each
-step moves it 1/7 of the way toward the measured block rate, at most 12% up or 30% down. There is no 20-minute rule.
-**Run `easynet-3.2` before block 4032** (due around 23:00 UTC on Wednesday 28 October): a node on `easynet-3.1` or
-older rejects block 4032 and stops at 4031. With the installer: `~/easynet/easynet update`.
+The previous easynet (reset 3, `easynet-3.2` and older) ended on 29 October: LayerTwo-Labs' current enforcer allows
+one sidechain proposal per block, and that chain had blocks with more. With the installer, `~/easynet/easynet update`
+moves the old chain aside and starts on this one.
 
 ## 1. Download
 
@@ -61,7 +57,7 @@ e.g. Ubuntu 20.04 and later) and macOS 14 or newer (one universal file for Apple
 **Linux:**
 
 ```
-T=easynet-3.2
+T=easynet-4
 U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
 curl -LO $U/bitcoin-$T-x86_64-linux-gnu.tar.gz
 curl -LO $U/bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
@@ -74,7 +70,7 @@ tar -xzf bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
 **macOS:**
 
 ```
-T=easynet-3.2
+T=easynet-4
 U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
 curl -LO $U/bitcoin-$T-universal-apple-darwin.tar.gz
 curl -LO $U/bip300301_enforcer-$T-universal-apple-darwin.tar.gz
@@ -86,9 +82,9 @@ tar -xzf bip300301_enforcer-$T-universal-apple-darwin.tar.gz
 
 The macOS binaries are signed ad hoc, not notarised by Apple. Downloaded with `curl` as above they run as they are.
 If you downloaded them in a browser, macOS refuses to open them; clear the download flag first:
-`xattr -dr com.apple.quarantine bitcoin-easynet-3.2 bip300301_enforcer-easynet-3.2-universal-apple-darwin`.
+`xattr -dr com.apple.quarantine bitcoin-easynet-4 bip300301_enforcer-easynet-4-universal-apple-darwin`.
 
-The node's programs are in `bitcoin-easynet-3.2/bin/`; the enforcer is in the `bip300301_enforcer-easynet-3.2-...`
+The node's programs are in `bitcoin-easynet-4/bin/`; the enforcer is in the `bip300301_enforcer-easynet-4-...`
 folder. The commands below assume you add both to your `PATH`, or type the paths.
 
 ## 2. Start a node
@@ -139,14 +135,15 @@ cpuminer -a sha256d -o stratum+tcp://seed.ecxfreebank.com:28334 -u tb1q... -p x
 
 ## 4. Run the enforcer (for sidechains)
 
-Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is a small fork of LayerTwo-Labs'
-bip300301_enforcer (https://github.com/mbdrivechains/bip300301_enforcer, branch `easynet`): an easynet preset and two
-block-template fixes. Published with Paul Sztorc's OK (DAA group, 2026-10-13).
+Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is LayerTwo-Labs' current bip300301_enforcer
+with three small changes (https://github.com/mbdrivechains/bip300301_enforcer, branch `easynet-4`): it reads easynet's
+chain name, builds block templates with our mempool fixes, and waits up to 600 s on the node. Published with Paul
+Sztorc's OK (DAA group, 2026-10-13).
 
 With the node from step 2 running, start it. On Linux:
 
 ```
-bip300301_enforcer --network-preset=easynet \
+bip300301_enforcer --fork=ecash \
   --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path=$HOME/.ecash/easynet/.cookie \
   --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
   --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
@@ -156,20 +153,22 @@ bip300301_enforcer --network-preset=easynet \
 On macOS, the same with the node's cookie in its macOS folder:
 
 ```
-bip300301_enforcer --network-preset=easynet \
+bip300301_enforcer --fork=ecash \
   --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$HOME/Library/Application Support/eCash/easynet/.cookie" \
   --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
   --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
   --bitcoin-core-skip-version-check
 ```
 
-Within a few seconds its log says `synced to tip`. It keeps its data in `~/.local/share/bip300301_enforcer` (Linux)
-or `~/Library/Application Support/bip300301_enforcer` (macOS), and serves gRPC on `127.0.0.1:50051`.
+It runs easynet as testnet4, whose address format easynet shares, with short sidechain thresholds (5 of 10 blocks).
+It keeps its data under `ecash/testnet4` in `~/.local/share/bip300301_enforcer` (Linux) or
+`~/Library/Application Support/bip300301_enforcer` (macOS), and serves gRPC on `127.0.0.1:50051`.
 
 ## 5. Sidechains
 
-The sidechains that are live or proposed on eCash's betanet are proposed on easynet too, with short activation thresholds
-(5 of 10 blocks), so a whole activation, deposit and withdrawal cycle takes hours, not months. Run each sidechain's
+easynet has the sidechains that ran on eCash's betanet (12 slots, proposed again from block 1 of this chain), with
+short activation thresholds (5 of 10 blocks), so a whole activation, deposit and withdrawal cycle takes hours, not
+months. Run each sidechain's
 own software, pointed at your enforcer's gRPC (`127.0.0.1:50051`) and your node.
 
 ## 6. Propose your own sidechain (M1)
@@ -177,7 +176,7 @@ own software, pointed at your enforcer's gRPC (`127.0.0.1:50051`) and your node.
 A sidechain starts as a proposal (M1) in a block's coinbase. A block carries your proposal only if it was built from
 your own enforcer's template, and the public pool builds from ours, so you mine a block yourself, on your CPU. After
 that our enforcer acks every proposal for an empty slot, and yours activates once it has more than 5 acks within 10
-blocks. Or post the slot number, title and description in the Telegram group, and we will propose it for you.
+blocks. A block carries at most one proposal. Or post the slot number, title and description in the Telegram group, and we will propose it for you.
 
 1. **Pick an empty slot** (0 to 255). The explorer lists the ones in use: https://easy.ecxfreebank.com/sidechains
 2. **Restart the enforcer with block templates on,** paying the block to your address (step 3 shows how to get one).
@@ -188,7 +187,7 @@ blocks. Or post the slot number, title and description in the Telegram group, an
    ```
    ~/easynet/easynet stop
    EASYNET_NO_ENFORCER=1 ~/easynet/easynet start
-   ~/easynet/current/bin/bip300301_enforcer --data-dir=$HOME/easynet/enforcer --network-preset=easynet \
+   ~/easynet/current/bin/bip300301_enforcer --data-dir=$HOME/easynet/enforcer --fork=ecash \
      --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path=$HOME/easynet/node/easynet/.cookie \
      --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
      --enable-wallet --wallet-auto-create --wallet-sync-source=disabled --bitcoin-core-skip-version-check \
@@ -217,8 +216,8 @@ blocks. Or post the slot number, title and description in the Telegram group, an
    cpuminer -a sha256d -o http://127.0.0.1:8123 -u x -p x -t 1
    ```
 
-   At today's difficulty, one thread of a desktop CPU finds a block in about 15 minutes on average; more threads,
-   sooner. Your block shows on
+   Up to block 288 one thread of a desktop CPU finds a block in a few minutes on average; after it, in 10 to 15
+   minutes; more threads, sooner. Your block shows on
    the explorer with your proposal in its coinbase. You can stop mining then.
 5. **Watch it activate,** usually within about 10 blocks:
    `grpcurl -plaintext 127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetSidechainProposals`, then
@@ -226,13 +225,13 @@ blocks. Or post the slot number, title and description in the Telegram group, an
 
 ## Resets and updates
 
-A reset brings a new genesis, and the last byte of the magic goes up by one. The release tag follows it (`easynet-3`
-is reset 3). An update within a reset keeps the chain (`easynet-3.2` is reset 3, update 2): replace the programs and
-restart, or run `~/easynet/easynet update`; there is no data to move. After a reset, download the new release and start from empty data: stop the node and the enforcer, move
-the node's `easynet` data folder aside, and in the enforcer's data folder move `validator/testnet4-easynet` and
-`wallet/testnet4-easynet` aside (keep `wallet/testnet4-easynet/seed.json` if you want the same wallet back).
+A reset brings a new genesis, and the last byte of the magic goes up by one. The release tag follows it (`easynet-4`
+is reset 4). An update within a reset keeps the chain (`easynet-3.2` was reset 3, update 2): replace the programs and
+restart, or run `~/easynet/easynet update`; there is no data to move. After a reset, download the new release and
+start from empty data: stop the node and the enforcer, and move the node's `easynet` data folder and the enforcer's
+data folder aside.
 
 ## Build from source
 
 - Node: this branch, with Bitcoin Core's build instructions (`cmake -B build && cmake --build build`).
-- Enforcer: `git clone -b easynet https://github.com/mbdrivechains/bip300301_enforcer && cd bip300301_enforcer && cargo build --release`.
+- Enforcer: `git clone -b easynet-4 https://github.com/mbdrivechains/bip300301_enforcer && cd bip300301_enforcer && cargo build --release`.
