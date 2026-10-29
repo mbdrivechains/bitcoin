@@ -52,7 +52,7 @@ jobs:
         run: |
           E=target/${{ matrix.target }}/release/bip300301_enforcer
           "$E" --version
-          "$E" --help | grep -A8 -- '--network-preset' | grep 'easynet:'
+          "$E" --help | grep -A4 -- '--fork <FORK>' | grep 'possible values: bitcoin, ecash'
 
       - name: Stage
         run: |
@@ -126,7 +126,7 @@ jobs:
             [ "$b" -gt 0 ] && [ "$b" = "$h" ] && break; sleep 2
           done
           echo "$I" | head -4
-          "$NAME/bip300301_enforcer" --network-preset=easynet \
+          "$NAME/bip300301_enforcer" --fork=ecash \
             --node-rpc-addr=127.0.0.1:28532 --node-rpc-cookie-path="$DD/easynet/.cookie" \
             --node-zmq-addr-sequence=tcp://127.0.0.1:28535 \
             --enable-wallet --wallet-auto-create --wallet-sync-source=disabled \
