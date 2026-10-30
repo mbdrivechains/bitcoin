@@ -5,9 +5,12 @@ name: enforcer-mainnet-mac
 # The release lives on mbdrivechains/bip300301_enforcer, which this repository's token can't write to, so the tarball
 # is downloaded from the run (gh run download) and attached there by hand.
 #   gh workflow run enforcer-mainnet-mac.yml -R mbdrivechains/bitcoin -f tag=ecash-mainnet-1
-# Same build as enforcer-mac.yml. The test runs the universal enforcer with the mainnet build's easynet flags
-# (--fork=ecash --network-magic=ea5e4e03) against an easynet macOS node from this repository's releases, on the live
-# easynet, with Homebrew hidden.
+#   gh workflow run enforcer-mainnet-mac.yml -R mbdrivechains/bitcoin -f tag=ecash-mainnet-2 -f live_test=regtest
+# Same build as enforcer-mac.yml. The test (Homebrew hidden) runs the universal enforcer either
+#   easynet: with ecash-mainnet-1's easynet flags (--fork=ecash --network-magic=ea5e4e03) against an easynet macOS node
+#            from this repository's releases, on the live easynet; or
+#   regtest: against a stock Bitcoin Core 30.2 regtest node (bitcoincore.org, sha256-pinned) with 101 blocks, for
+#            ecash-mainnet-2 and later (L2L v1.0.1 base, which has no easynet preset).
 
 on:
   workflow_dispatch:
@@ -19,6 +22,12 @@ on:
         description: "easynet release here whose macOS node the test runs against"
         required: true
         default: "easynet-3.1"
+      live_test:
+        description: "easynet (ecash-mainnet-1) or regtest (ecash-mainnet-2 and later)"
+        required: true
+        default: "easynet"
+        type: choice
+        options: [easynet, regtest]
 
 permissions:
   contents: read
@@ -57,7 +66,7 @@ jobs:
         run: |
           E=target/${{ matrix.target }}/release/bip300301_enforcer
           "$E" --version
-          "$E" --help | grep -A4 -- '--fork <FORK>' | grep 'possible values: bitcoin, ecash-alphanet, ecash-betanet, ecash'
+          "$E" --help | grep -A4 -- '--fork <FORK>' | grep -E 'possible values: bitcoin.*, ecash(\]|,)'
 
       - name: Stage
         run: |
@@ -113,6 +122,7 @@ jobs:
           [ -z "$BAD" ] || { echo "NON-PORTABLE:"; echo "$BAD"; exit 1; }
 
       - name: Run against the live easynet with --fork=ecash (Homebrew hidden)
+        if: inputs.live_test == 'easynet'
         run: |
           gh release download "$NODE_RELEASE" -R "$GITHUB_REPOSITORY" -p "bitcoin-${NODE_RELEASE}-universal-apple-darwin.tar.gz"
           tar -xzf "bitcoin-${NODE_RELEASE}-universal-apple-darwin.tar.gz"
@@ -149,6 +159,42 @@ jobs:
           sleep 3
           [ $ok = 1 ] || { echo "enforcer did not sync to the tip"; tail -30 enforcer.log; exit 1; }
           echo "enforcer synced easynet to block $b"
+
+      - name: Run against a stock Bitcoin Core 30.2 regtest node (Homebrew hidden)
+        if: inputs.live_test == 'regtest'
+        run: |
+          C=bitcoin-30.2-arm64-apple-darwin.tar.gz
+          curl -fsSLO "https://bitcoincore.org/bin/bitcoin-core-30.2/$C"
+          echo "c2ecab62891de22228043815cb6211549a32272be3d5d052ff19847d3420bd10  $C" | shasum -a 256 -c
+          tar -xzf "$C"
+          B=$PWD/bitcoin-30.2/bin
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          DD=$PWD/regtest-node
+          mkdir -p "$DD"
+          "$B/bitcoind" -regtest -datadir="$DD" -daemon -txindex=1 -listen=0 -zmqpubsequence=tcp://127.0.0.1:28545
+          for i in $(seq 1 30); do "$B/bitcoin-cli" -regtest -datadir="$DD" getblockchaininfo >/dev/null 2>&1 && break; sleep 1; done
+          "$B/bitcoin-cli" -regtest -datadir="$DD" generatetoaddress 101 bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080 >/dev/null
+          "$NAME/bip300301_enforcer" --data-dir="$PWD/enforcer-data" \
+            --node-rpc-addr=127.0.0.1:18443 --node-rpc-cookie-path="$DD/regtest/.cookie" \
+            --node-zmq-addr-sequence=tcp://127.0.0.1:28545 \
+            --enable-wallet --wallet-auto-create --wallet-sync-source=disabled > enforcer.log 2>&1 &
+          P=$!
+          ok=0
+          for i in $(seq 1 60); do
+            grep -qE "Synced [0-9]+ blocks in" enforcer.log && { ok=1; break; }
+            kill -0 $P 2>/dev/null || break
+            sleep 2
+          done
+          grep -E "Connected to mainchain|Synced [0-9]+ blocks in|ERROR" enforcer.log | head -5 || true
+          sleep 5
+          kill -0 $P 2>/dev/null || { echo "enforcer exited"; ok=0; }
+          grep -q " ERROR " enforcer.log && { echo "enforcer logged an ERROR"; ok=0; }
+          kill $P 2>/dev/null || true
+          "$B/bitcoin-cli" -regtest -datadir="$DD" stop
+          sleep 3
+          [ $ok = 1 ] || { echo "enforcer did not sync the regtest chain"; tail -30 enforcer.log; exit 1; }
+          echo "enforcer synced 102 regtest blocks and kept running"
 
       - name: Package
         run: |
