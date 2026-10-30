@@ -1,3 +1,6 @@
+> **This is the `easynet` branch** (github.com/mbdrivechains/bitcoin): eCash's code with the easynet test
+> network. To join it, see [EASYNET.md](EASYNET.md).
+
 > This is a forked version of `bitcoin/bitcoin`. It branches off of v32.1
 > and applies a series of [eCash](https://ecash.com/)-related patches.
 

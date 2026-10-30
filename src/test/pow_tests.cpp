@@ -18,6 +18,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -503,13 +504,35 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
     BOOST_CHECK(!over);
     BOOST_CHECK(UintToArith256(consensus.powLimit) >= pow_compact);
 
-    // an ASERT anchor needs a parent block, a positive half-life, no min-difficulty blocks, and a
+    // an ASERT anchor needs a parent block, a positive half-life, a min-difficulty-safe anchor, and a
     // powLimit below 2^239 so refTarget * factor (< 2^17) fits -- see pow.cpp:CalculateASERT()
     if (consensus.EcashAsertAnchorHeight != 0) {
         BOOST_CHECK(consensus.EcashAsertAnchorHeight >= 1);
         BOOST_CHECK(consensus.EcashAsertHalfLife > 0);
-        BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+        // With min-difficulty blocks (the 20-minute rule) the anchor must be a retarget block, which
+        // can never be one of them: a multiple of the interval, with BIP94's first-block rule on.
+        if (consensus.fPowAllowMinDifficultyBlocks) {
+            BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight % consensus.DifficultyAdjustmentInterval(), 0);
+            BOOST_CHECK(consensus.enforce_BIP94);
+        }
         BOOST_CHECK((UintToArith256(consensus.powLimit) >> 239) == 0);
+    }
+
+    // ASERT may end only where the 288-block rule begins, so every height has exactly one rule
+    if (consensus.EcashAsertEndHeight != 0) {
+        BOOST_CHECK(consensus.EcashAsertAnchorHeight > 0);
+        BOOST_CHECK(consensus.EcashAsertEndHeight > consensus.EcashAsertAnchorHeight);
+        BOOST_CHECK_EQUAL(consensus.EcashAsertEndHeight, consensus.EcashHeight);
+    }
+
+    // the fork block's difficulty reset happens on a retarget block, so the fork height is one, and its
+    // forced difficulty is a valid target within powLimit
+    if (consensus.EcashHeight > 0) {
+        BOOST_CHECK_EQUAL(consensus.EcashHeight % consensus.DifficultyAdjustmentInterval(consensus.EcashHeight), 0);
+        arith_uint256 fork_target;
+        fork_target.SetCompact(consensus.EcashForkBits, &neg, &over);
+        BOOST_CHECK(!neg && !over && fork_target != 0);
+        BOOST_CHECK(fork_target <= UintToArith256(consensus.powLimit));
     }
 
     // check max target * 4*nPowTargetTimespan doesn't overflow -- see pow.cpp:CalculateNextWorkRequired()
@@ -566,6 +589,112 @@ BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_sanity)
 {
     sanity_check_chainparams(*m_node.args, ChainType::TESTNET4);
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_EASYNET_sanity)
+{
+    sanity_check_chainparams(*m_node.args, ChainType::EASYNET);
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::EASYNET)->GetConsensus();
+    // easynet-4: eCash mainnet's 288-block rule from block 288, with the fork block at difficulty 1.4255; no ASERT,
+    // no 20-minute rule
+    BOOST_CHECK_EQUAL(consensus.EcashAsertAnchorHeight, 0);
+    BOOST_CHECK_EQUAL(consensus.EcashAsertEndHeight, 0);
+    BOOST_CHECK(!consensus.fPowAllowMinDifficultyBlocks);
+    BOOST_CHECK_EQUAL(consensus.EcashHeight, 288);
+    BOOST_CHECK_EQUAL(consensus.EcashForkBits, 0x1d00b395U);
+}
+
+// easynet-4: eCash mainnet's 288-block rule from EcashHeight. Before it, the genesis difficulty, with no 20-minute
+// rule; at it, the forced fork difficulty, whatever the chain before looked like; then that difficulty, with no
+// 20-minute rule, up to the first retarget, which measures from the fork block; each retarget after that starts at
+// the previous window's last block. Each step is (6 * old + measured) / 7, measured clamped to a quarter and four times the 288 * 600 s
+// target, so difficulty moves at most +12% or -30% a window.
+BOOST_AUTO_TEST_CASE(easynet_288_block_rule)
+{
+    const auto chainParams = CreateChainParams(*m_node.args, ChainType::EASYNET);
+    const auto& params = chainParams->GetConsensus();
+    const int fork = params.EcashHeight;
+    const int64_t spacing = params.nPowTargetSpacing;
+    const int64_t window = 288 * spacing;
+    const arith_uint256 pow_limit{UintToArith256(params.powLimit)};
+    const uint32_t pow_limit_bits = pow_limit.GetCompact();
+    const uint32_t normal_bits = chainParams->GenesisBlock().nBits;
+    const int64_t t0 = chainParams->GenesisBlock().nTime;
+    BOOST_REQUIRE_EQUAL(params.DifficultyAdjustmentInterval(fork - 1), 2016);
+    BOOST_REQUIRE_EQUAL(params.DifficultyAdjustmentInterval(fork), 288);
+
+    // An on-schedule chain: the genesis bits up to the fork, which then carries the fork bits.
+    std::vector<CBlockIndex> blocks(fork + 3 * 288 + 1);
+    for (int i = 0; i < (int)blocks.size(); i++) {
+        blocks[i].pprev = i ? &blocks[i - 1] : nullptr;
+        blocks[i].nHeight = i;
+        blocks[i].nTime = t0 + i * spacing;
+        blocks[i].nBits = i < fork ? normal_bits : params.EcashForkBits;
+    }
+    const auto next = [&](int height, int64_t delay) {
+        CBlockHeader header;
+        header.nTime = blocks[height - 1].nTime + delay;
+        return GetNextWorkRequired(&blocks[height - 1], &header, params);
+    };
+    const auto damped = [&](uint32_t old_bits, int64_t measured) {
+        measured = std::clamp(measured, window / 4, window * 4);
+        arith_uint256 target;
+        target.SetCompact(old_bits);
+        target *= 6 * window + measured;
+        target /= 7 * window;
+        return std::min(target, pow_limit).GetCompact();
+    };
+
+    // Before the fork the genesis bits hold, however late the block: no ASERT, no 20-minute rule.
+    for (const int height : {1, 2, fork - 1}) {
+        BOOST_CHECK(!IsAsertHeight(params, height));
+        BOOST_CHECK_EQUAL(next(height, spacing), normal_bits);
+        BOOST_CHECK_EQUAL(next(height, 2 * spacing + 1), normal_bits);
+        BOOST_CHECK_EQUAL(next(height, 2 * 60 * 60), normal_bits);
+    }
+    BOOST_CHECK(!IsAsertHeight(params, fork));
+
+    // The fork block: the fork bits, on time or hours late, and whatever the blocks before it took.
+    BOOST_CHECK_EQUAL(next(fork, spacing), params.EcashForkBits);
+    BOOST_CHECK_EQUAL(next(fork, 3 * 60 * 60), params.EcashForkBits);
+    blocks[fork - 288].nTime -= 10 * window;
+    BOOST_CHECK_EQUAL(next(fork, spacing), params.EcashForkBits);
+    blocks[fork - 288].nTime += 10 * window;
+
+    // Between retargets the parent's bits hold: no 20-minute rule, however late the block.
+    for (const int height : {fork + 1, fork + 2, fork + 287}) {
+        BOOST_CHECK_EQUAL(next(height, spacing), params.EcashForkBits);
+        BOOST_CHECK_EQUAL(next(height, 2 * spacing + 1), params.EcashForkBits);
+        BOOST_CHECK_EQUAL(next(height, 2 * 60 * 60), params.EcashForkBits);
+        BOOST_CHECK(next(height, 2 * 60 * 60) != pow_limit_bits);
+    }
+
+    // The first retarget measures from the fork block itself (287 intervals), not from before the fork.
+    const int r1 = fork + 288;
+    BOOST_CHECK_EQUAL(next(r1, spacing), damped(params.EcashForkBits, 287 * spacing));
+    // A window four times too slow or more is clamped: the target rises by 10/7 (difficulty -30%).
+    blocks[fork].nTime -= 10 * window;
+    BOOST_CHECK_EQUAL(next(r1, spacing), damped(params.EcashForkBits, window * 4));
+    arith_uint256 slow, fork_target;
+    slow.SetCompact(next(r1, spacing));
+    fork_target.SetCompact(params.EcashForkBits);
+    BOOST_CHECK(slow > fork_target * 14 / 10 && slow < fork_target * 15 / 10);
+    // A window four times too fast or more is clamped: the target falls by 6.25/7 (difficulty +12%).
+    blocks[fork].nTime = blocks[r1 - 1].nTime - 1;
+    BOOST_CHECK_EQUAL(next(r1, spacing), damped(params.EcashForkBits, window / 4));
+    arith_uint256 fast;
+    fast.SetCompact(next(r1, spacing));
+    BOOST_CHECK(fast < fork_target * 90 / 100 && fast > fork_target * 89 / 100);
+    blocks[fork].nTime = t0 + fork * spacing;
+
+    // The second retarget starts at the first window's last block: exactly 288 intervals on time leaves the
+    // target as it was.
+    const int r2 = fork + 2 * 288;
+    BOOST_CHECK_EQUAL(next(r2, spacing), damped(params.EcashForkBits, window));
+    BOOST_CHECK_EQUAL(next(r2, spacing), params.EcashForkBits);
+    // Twice as slow: the target rises by 8/7.
+    for (int i = r1 - 1; i < r2; i++) blocks[i].nTime = blocks[r1 - 1].nTime + (i - (r1 - 1)) * 2 * spacing;
+    BOOST_CHECK_EQUAL(next(r2, spacing), damped(params.EcashForkBits, 2 * window));
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_SIGNET_sanity)

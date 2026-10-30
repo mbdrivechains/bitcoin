@@ -100,6 +100,11 @@ struct Params {
      * 0 disables ASERT and keeps the 2016-block rule everywhere.
      */
     int EcashAsertAnchorHeight{0};
+    /**
+     * First height no longer under ASERT; the 288-block rule from EcashHeight takes over there
+     * (easynet, from easynet-3.2). 0 means ASERT never ends.
+     */
+    int EcashAsertEndHeight{0};
     /** ASERT half-life in seconds: the schedule slip that doubles or halves the target. */
     int64_t EcashAsertHalfLife{0};
     /**
