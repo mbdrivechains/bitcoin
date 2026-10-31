@@ -29,7 +29,7 @@ touched). Nothing runs as root and nothing starts at boot. Afterwards:
 To read the script before running it: `curl -fsSLO <the URL above>`, read `easynet.sh`, then `bash easynet.sh`.
 Steps 1 to 4 below do the same by hand.
 
-## The network now (reset 4, 2026-10-29, release `easynet-4`)
+## The network now (reset 4, 2026-10-29; release `easynet-4.1`, 2026-10-31)
 
 | | |
 |---|---|
@@ -45,6 +45,11 @@ as eCash mainnet's fork block does. After it, eCash mainnet's difficulty rule: t
 288 blocks (about two days), each step moving it 1/7 of the way toward the measured block rate, at most 12% up or 30%
 down. There is no 20-minute rule, so if mining stops, the chain stops until it resumes.
 
+`easynet-4.1` (31 October) changes only the programs, not the chain: the node is eCash v1.2.0 (Bitcoin Core 32.1),
+and the enforcer is the one eCash mainnet runs (`ecash-mainnet-3`). With the installer, `~/easynet/easynet update`;
+by hand, replace both programs and restart. Move both together: `easynet-4`'s enforcer can't read a v1.2.0 node's
+mempool and stops serving block templates (`easynet-4`'s node with its own enforcer still works on this chain).
+
 The previous easynet (reset 3, `easynet-3.2` and older) ended on 29 October: LayerTwo-Labs' current enforcer allows
 one sidechain proposal per block, and that chain had blocks with more. With the installer, `~/easynet/easynet update`
 moves the old chain aside and starts on this one.
@@ -57,7 +62,7 @@ e.g. Ubuntu 20.04 and later) and macOS 14 or newer (one universal file for Apple
 **Linux:**
 
 ```
-T=easynet-4
+T=easynet-4.1
 U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
 curl -LO $U/bitcoin-$T-x86_64-linux-gnu.tar.gz
 curl -LO $U/bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
@@ -70,7 +75,7 @@ tar -xzf bip300301_enforcer-$T-x86_64-linux-gnu.tar.gz
 **macOS:**
 
 ```
-T=easynet-4
+T=easynet-4.1
 U=https://github.com/mbdrivechains/bitcoin/releases/download/$T
 curl -LO $U/bitcoin-$T-universal-apple-darwin.tar.gz
 curl -LO $U/bip300301_enforcer-$T-universal-apple-darwin.tar.gz
@@ -82,9 +87,9 @@ tar -xzf bip300301_enforcer-$T-universal-apple-darwin.tar.gz
 
 The macOS binaries are signed ad hoc, not notarised by Apple. Downloaded with `curl` as above they run as they are.
 If you downloaded them in a browser, macOS refuses to open them; clear the download flag first:
-`xattr -dr com.apple.quarantine bitcoin-easynet-4 bip300301_enforcer-easynet-4-universal-apple-darwin`.
+`xattr -dr com.apple.quarantine bitcoin-easynet-4.1 bip300301_enforcer-easynet-4.1-universal-apple-darwin`.
 
-The node's programs are in `bitcoin-easynet-4/bin/`; the enforcer is in the `bip300301_enforcer-easynet-4-...`
+The node's programs are in `bitcoin-easynet-4.1/bin/`; the enforcer is in the `bip300301_enforcer-easynet-4.1-...`
 folder. The commands below assume you add both to your `PATH`, or type the paths.
 
 ## 2. Start a node
@@ -135,10 +140,11 @@ cpuminer -a sha256d -o stratum+tcp://seed.ecxfreebank.com:28334 -u tb1q... -p x
 
 ## 4. Run the enforcer (for sidechains)
 
-Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is LayerTwo-Labs' current bip300301_enforcer
-with four small changes (https://github.com/mbdrivechains/bip300301_enforcer, branch `easynet-4`): it reads easynet's
-chain name, starts its wallet from easynet's genesis, builds block templates with our mempool fixes, and waits up to
-600 s on the node. Published with Paul Sztorc's OK (DAA group, 2026-10-13).
+Sidechain nodes talk to a BIP 300/301 enforcer next to your node. Ours is the one eCash mainnet runs: LayerTwo-Labs'
+bip300301_enforcer v1.0.1 with our changes (https://github.com/mbdrivechains/bip300301_enforcer, tag
+`ecash-mainnet-3`; mempool code from https://github.com/mbdrivechains/cusf-enforcer-mempool at `01d1e14`). It reads
+easynet's chain name, starts its wallet from easynet's genesis, builds block templates with our mempool fixes,
+re-bids BMM safely when a bid goes stale, and waits up to 600 s on the node. Published with Paul Sztorc's OK (DAA group, 2026-10-13).
 
 With the node from step 2 running, start it. On Linux:
 
@@ -226,7 +232,7 @@ blocks. A block carries at most one proposal. Or post the slot number, title and
 ## Resets and updates
 
 A reset brings a new genesis, and the last byte of the magic goes up by one. The release tag follows it (`easynet-4`
-is reset 4). An update within a reset keeps the chain (`easynet-3.2` was reset 3, update 2): replace the programs and
+is reset 4). An update within a reset keeps the chain (`easynet-4.1` is reset 4, update 1): replace the programs and
 restart, or run `~/easynet/easynet update`; there is no data to move. After a reset, download the new release and
 start from empty data: stop the node and the enforcer, and move the node's `easynet` data folder and the enforcer's
 data folder aside.
@@ -234,4 +240,4 @@ data folder aside.
 ## Build from source
 
 - Node: this branch, with Bitcoin Core's build instructions (`cmake -B build && cmake --build build`).
-- Enforcer: `git clone -b easynet-4 https://github.com/mbdrivechains/bip300301_enforcer && cd bip300301_enforcer && cargo build --release`.
+- Enforcer: `git clone -b ecash-mainnet-3 https://github.com/mbdrivechains/bip300301_enforcer && cd bip300301_enforcer && cargo build --release`.
